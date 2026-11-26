@@ -179,32 +179,27 @@ pub fn run_command(command: &str) -> Result<(i32, String)> {
                 fn jobs(&self) -> Vec<(String, String, bool)> { Vec::new() }
                 fn run_job(&self, _name: &str) -> anyhow::Result<i32> { Ok(0) }
             }
-            let _ = crate::pyhost::init(Box::new(NoopApi));
+            let init_result = crate::pyhost::init(Box::new(NoopApi));
+            if let Err(e) = &init_result {
+                eprintln!("pyhost init failed: {e:#}");
+            }
             let source = std::fs::read_to_string(command)
                 .with_context(|| format!("read python job {command}"))?;
             match crate::pyhost::run_source(&source) {
                 Ok(stdout) => return finish(0, &stdout),
-                Err(e) => return finish(1, &format!("{e:#}")),
-            }
-        }
-        #[cfg(target_os = "windows")]
-        {
-            // Same embedded interpreter as the hub (abi3 + bundled runtime/);
-            // fall back to the system python subprocess when the interpreter
-            // cannot start (missing python3.dll and no bundle).
-            match crate::pyhost::run_source(&std::fs::read_to_string(command)
-                .with_context(|| format!("read python job {command}"))?)
-            {
-                Ok(stdout) => return finish(0, &stdout),
                 Err(e) => {
-                    // Embedded path failed: try system python as last resort.
-                    use std::process::Command;
-                    if let Ok(output) = Command::new("python").arg(command).output() {
-                        let mut text = String::new();
-                        text.push_str(&String::from_utf8_lossy(&output.stdout));
-                        text.push_str(&String::from_utf8_lossy(&output.stderr));
-                        let code = output.status.code().unwrap_or(-1);
-                        return finish(code, &text);
+                    // Embedded path failed (init or exec): fall back to the
+                    // system python subprocess as last resort.
+                    #[cfg(target_os = "windows")]
+                    {
+                        use std::process::Command;
+                        if let Ok(output) = Command::new("python").arg(command).output() {
+                            let mut text = String::new();
+                            text.push_str(&String::from_utf8_lossy(&output.stdout));
+                            text.push_str(&String::from_utf8_lossy(&output.stderr));
+                            let code = output.status.code().unwrap_or(-1);
+                            return finish(code, &text);
+                        }
                     }
                     return finish(1, &format!("{e:#}"));
                 }
