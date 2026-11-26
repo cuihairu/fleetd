@@ -629,6 +629,13 @@ fn main() -> Result<()> {
             // `claude -p` process on the picked host, streams JSONL events to
             // /tmp/fleetd-runs/<id>/, outcome read from the event file.
             if args.iter().any(|a| a == "--headless") {
+                // --agent claude|codex|opencode (default claude)
+                let kind = args
+                    .iter()
+                    .position(|a| a == "--agent")
+                    .and_then(|i| args.get(i + 1))
+                    .map(String::as_str)
+                    .unwrap_or("claude");
                 let _ = repo; // reserved: repo binding for the run workspace
                 let run_id = format!(
                     "{}-{}",
@@ -643,22 +650,22 @@ fn main() -> Result<()> {
                         .trim_end_matches(".md")
                 );
                 let host = "local"; // step 1: local runs; remote pick lands with step 2
-                headless::launch(host, &run_id, task_file, "bypassPermissions")
+                headless::launch(host, kind, &run_id, task_file, "bypassPermissions")
                     .context("headless launch failed")?;
-                // Wait for the protocol-level ack (system/init) before
+                // Wait for the protocol-level ack (agent start marker) before
                 // declaring delivery — no screen scraping.
                 let mut delivered = false;
                 for _ in 0..30 {
                     std::thread::sleep(std::time::Duration::from_secs(2));
-                    if headless::confirm_start(host, &run_id) {
+                    if headless::confirm_start(host, kind, &run_id) {
                         delivered = true;
                         break;
                     }
                 }
                 let ledger_c = ledger::open()?;
-                ledger::record_dispatch(&ledger_c, "headless", &run_id, None)?;
+                ledger::record_dispatch(&ledger_c, &format!("headless-{kind}"), &run_id, None)?;
                 println!(
-                    "HEADLESS {run_id} | {} | stream: /tmp/fleetd-runs/{run_id}/stream.jsonl",
+                    "HEADLESS {kind}/{run_id} | {} | stream: /tmp/fleetd-runs/{run_id}/stream.jsonl",
                     if delivered { "DELIVERED" } else { "NO-INIT (poll: fleetd watch)" }
                 );
             } else {
@@ -678,7 +685,13 @@ fn main() -> Result<()> {
                 .get(3)
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(20);
-            match headless::poll_state(host, run_id) {
+            let kind = args
+                .iter()
+                .position(|a| a == "--agent")
+                .and_then(|i| args.get(i + 1))
+                .map(String::as_str)
+                .unwrap_or("claude");
+            match headless::poll_state(host, kind, run_id) {
                 headless::RunState::Finished(sub) => println!("state: FINISHED result={sub}"),
                 headless::RunState::Working => println!("state: WORKING"),
                 headless::RunState::NotStarted => println!("state: NOT-STARTED"),
