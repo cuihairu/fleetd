@@ -12,6 +12,7 @@ mod mcp_server;
 mod probe;
 mod resources;
 mod summary;
+mod tools;
 mod topology;
 
 // Windows tray (wood gear, rotating frames); compiled only on windows targets.
@@ -681,6 +682,39 @@ fn main() -> Result<()> {
                 );
             } else {
                 dispatch(cfg.as_ref().context("config required")?, task_file, repo)?;
+            }
+        }
+        // --- agent toolchain lifecycle: install/inventory across hosts ---
+        Some("tools") => {
+            match args.get(2).map(String::as_str) {
+                Some("list") => {
+                    let hosts = ["local", "work-runner", "imac"];
+                    for t in [tools::Tool::Claude, tools::Tool::Codex, tools::Tool::Opencode] {
+                        println!("{}:", t.name());
+                        for (h, v) in tools::inventory(&hosts, t) {
+                            println!("  {h:<14} {v}");
+                        }
+                    }
+                }
+                Some("install") => {
+                    let agent = args.get(3).context("usage: fleetd tools install <claude|codex|opencode> [--host <alias>]")?;
+                    let tool = tools::Tool::from_str(agent)
+                        .context("unknown agent; supported: claude codex opencode")?;
+                    let host = args
+                        .iter()
+                        .position(|a| a == "--host")
+                        .and_then(|i| args.get(i + 1))
+                        .map(String::as_str)
+                        .unwrap_or("local");
+                    println!("installing {} on {host} (official installer)...", tool.name());
+                    match tools::install(host, tool) {
+                        Ok(v) => println!("OK: {} now {v}", tool.name()),
+                        Err(e) => bail!("install failed: {e}"),
+                    }
+                }
+                _ => {
+                    println!("usage: fleetd tools list | tools install <agent> [--host <alias>]");
+                }
             }
         }
         // --- headless run observability: tail the event stream ---
