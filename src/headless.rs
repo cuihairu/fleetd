@@ -38,12 +38,16 @@ pub struct HeadlessSpec {
 }
 
 pub const SPECS: &[HeadlessSpec] = &[
+    // claude --bg variant (2026-11-27): the background session is
+    // attachable via `claude attach <id>` — the official multi-terminal
+    // face. The launch prints the session id; we capture it into
+    // session-id for the ledger and `fleetd attach`.
     HeadlessSpec {
         kind: "claude",
-        launch_cmd: "mkdir -p {dir} && cp {tf} {dir}/task.md && { setsid nohup claude -p \"$(cat {dir}/task.md)\" --output-format stream-json --verbose --permission-mode {pm} > {dir}/stream.jsonl 2> {dir}/stderr.log & } && echo done",
-        start_marker: "\"subtype\":\"init\"",
+        launch_cmd: "mkdir -p {dir} && cp {tf} {dir}/task.md && { setsid nohup claude --bg --permission-mode {pm} \"$(cat {dir}/task.md)\" > {dir}/session-id 2> {dir}/stderr.log & } && echo done",
+        start_marker: "",
         fail_marker: "",
-        ok_marker: "\"type\":\"result\"",
+        ok_marker: "",
     },
     HeadlessSpec {
         kind: "codex",
@@ -222,7 +226,10 @@ mod tests {
         let cmd = remote_launch_cmd("claude", "r1", "/tmp/my task.md", "acceptEdits");
         assert!(cmd.contains("'/tmp/my task.md'"));
         assert!(cmd.contains("--permission-mode 'acceptEdits'"));
-        assert!(cmd.contains("stream.jsonl"));
+        // --bg mode: session id lands in session-id (attachable face), no
+        // stream.jsonl — state comes from `claude agents --json`.
+        assert!(cmd.contains("session-id"));
+        assert!(cmd.contains("claude --bg"));
         assert!(cmd.contains("setsid nohup"));
     }
 
