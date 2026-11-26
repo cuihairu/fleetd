@@ -157,16 +157,52 @@ pub fn ts(v: i64) -> DateTime<Local> {
 }
 
 /// Run one shell command, capture tail, return (exit_code, output_tail).
+/// Commands ending in `.py` run through Python: the embedded interpreter on
+/// the Linux hub (full CPython via PyO3), the system Python on Windows seats
+/// (no libpython there — same `fleetd` hook module, different source).
 pub fn run_command(command: &str) -> Result<(i32, String)> {
-    use std::process::Command;
-    let output = Command::new("bash").arg("-c").arg(command).output()
-        .with_context(|| "spawn job command")?;
-    let mut text = String::new();
-    text.push_str(&String::from_utf8_lossy(&output.stdout));
-    text.push_str(&String::from_utf8_lossy(&output.stderr));
-    let tail: String = text.chars().rev().take(2000).collect::<Vec<_>>().into_iter().rev().collect();
-    let code = output.status.code().unwrap_or(-1);
-    Ok((code, tail))
+    let finish = |code: i32, text: &str| -> Result<(i32, String)> {
+        let tail: String = text.chars().rev().take(2000).collect::<Vec<_>>().into_iter().rev().collect();
+        Ok((code, tail))
+    };
+
+    if command.trim_end().ends_with(".py") {
+        #[cfg(target_os = "linux")]
+        {
+            let source = std::fs::read_to_string(command)
+                .with_context(|| format!("read python job {command}"))?;
+            let code = match crate::pyhost::run_source(&source) {
+                Ok(stdout) => return finish(0, &stdout),
+                Err(e) => return finish(1, &format!("{e:#}")),
+            };
+            let _ = code;
+        }
+        #[cfg(target_os = "windows")]
+        {
+            use std::process::Command;
+            let output = Command::new("python").arg(command).output()
+                .with_context(|| format!("spawn system python for {command}"))?;
+            let mut text = String::new();
+            text.push_str(&String::from_utf8_lossy(&output.stdout));
+            text.push_str(&String::from_utf8_lossy(&output.stderr));
+            let code = output.status.code().unwrap_or(-1);
+            return finish(code, &text);
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        {
+            let _ = command;
+            anyhow::bail!("python jobs not supported on this platform")
+        }
+    } else {
+        use std::process::Command;
+        let output = Command::new("bash").arg("-c").arg(command).output()
+            .with_context(|| "spawn job command")?;
+        let mut text = String::new();
+        text.push_str(&String::from_utf8_lossy(&output.stdout));
+        text.push_str(&String::from_utf8_lossy(&output.stderr));
+        let code = output.status.code().unwrap_or(-1);
+        finish(code, &text)
+    }
 }
 
 /// Long-running scheduler loop. Checks due jobs every 30 seconds.
@@ -175,6 +211,20 @@ pub fn serve<F>(mut check_and_run: F) -> !
 where
     F: FnMut() -> Result<usize>,
 {
+    // Boot the embedded interpreter so `.py` jobs have `import fleetd`.
+    // (The real LedgerApi adapter lands with the MCP exposure step.)
+    #[cfg(target_os = "linux")]
+    {
+        struct NoopApi;
+        impl crate::pyhost::FleetdApi for NoopApi {
+            fn log(&self, _m: &str) {}
+            fn alert(&self, _m: &str) {}
+            fn seats(&self) -> Vec<(String, String)> { Vec::new() }
+            fn jobs(&self) -> Vec<(String, String, bool)> { Vec::new() }
+            fn run_job(&self, _name: &str) -> anyhow::Result<i32> { Ok(0) }
+        }
+        let _ = crate::pyhost::init(Box::new(NoopApi));
+    }
     loop {
         match check_and_run() {
             Ok(n) if n > 0 => eprintln!("scheduler: ran {n} job(s)"),
@@ -251,5 +301,28 @@ mod tests {
         assert!(parse_schedule("* 24 * * *").is_err());
         assert!(parse_schedule("*/0 * * * *").is_err());
         assert!(parse_schedule("1-5 * * * *").is_ok());
+    }
+}
+
+#[cfg(test)]
+mod pyjob_tests {
+    #[test]
+    fn py_job_runs_embedded() {
+        // The scheduler loop calls pyhost::init; tests must too (OnceLock is
+        // per-process and the loop isn't running under cargo test).
+        struct NoopApi;
+        impl crate::pyhost::FleetdApi for NoopApi {
+            fn log(&self, _m: &str) {}
+            fn alert(&self, _m: &str) {}
+            fn seats(&self) -> Vec<(String, String)> { Vec::new() }
+            fn jobs(&self) -> Vec<(String, String, bool)> { Vec::new() }
+            fn run_job(&self, _name: &str) -> anyhow::Result<i32> { Ok(0) }
+        }
+        let _ = crate::pyhost::init(Box::new(NoopApi));
+        let path = std::env::temp_dir().join("fleetd-e2e-pyjob.py");
+        std::fs::write(&path, "import fleetd\nprint('e2e-ok', hasattr(fleetd,'seats'))").unwrap();
+        let (code, out) = super::run_command(path.to_str().unwrap()).unwrap();
+        assert_eq!(code, 0, "py job failed: {out}");
+        assert!(out.contains("e2e-ok True"), "stdout: {out}");
     }
 }

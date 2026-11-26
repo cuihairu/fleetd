@@ -12,6 +12,11 @@ mod topology;
 // Windows tray (wood gear, rotating frames); compiled only on windows targets.
 #[cfg(target_os = "windows")]
 mod tray;
+
+// Embedded CPython (PyO3) for .py jobs on the hub; Windows seats use the
+// system Python (see scheduler::run_command).
+#[cfg(target_os = "linux")]
+mod pyhost;
 mod scheduler;
 
 use anyhow::{bail, Context, Result};
