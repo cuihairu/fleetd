@@ -8,6 +8,10 @@ mod mcp_server;
 mod probe;
 mod resources;
 mod topology;
+
+// Windows tray (wood gear, rotating frames); compiled only on windows targets.
+#[cfg(target_os = "windows")]
+mod tray;
 mod scheduler;
 
 use anyhow::{bail, Context, Result};
@@ -520,6 +524,14 @@ fn main() -> Result<()> {
             println!("{seat} -> {verdict}");
         }
         Some("serve") => {
+            // Windows: show the rotating wood gear in the tray so the person
+            // at the machine can see fleetd is running. --no-tray suppresses it.
+            #[cfg(target_os = "windows")]
+            let _tray = if args.iter().any(|a| a == "--no-tray") {
+                None
+            } else {
+                crate::tray::spawn()
+            };
             // fleetd serve [--port 3790] [--no-scheduler]
             let port = args
                 .iter()
