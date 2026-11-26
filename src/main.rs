@@ -2,6 +2,9 @@ mod agent;
 mod config;
 mod dispatcher;
 mod events;
+// Headless dispatch channel (2026-11-27): spawn `claude -p` per task, JSONL
+// event stream as the source of truth; tmux demoted to debug surface.
+mod headless;
 mod ledger;
 mod jobs;
 mod mcp_server;
@@ -622,7 +625,65 @@ fn main() -> Result<()> {
             let repo = args
                 .get(3)
                 .context("usage: fleetd dispatch <task.md> <repo>")?;
-            dispatch(cfg.as_ref().context("config required")?, task_file, repo)?;
+            // --headless: new structured channel (2026-11-27). Spawns one
+            // `claude -p` process on the picked host, streams JSONL events to
+            // /tmp/fleetd-runs/<id>/, outcome read from the event file.
+            if args.iter().any(|a| a == "--headless") {
+                let _ = repo; // reserved: repo binding for the run workspace
+                let run_id = format!(
+                    "{}-{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
+                    &task_file
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or("task")
+                        .trim_end_matches(".md")
+                );
+                let host = "local"; // step 1: local runs; remote pick lands with step 2
+                headless::launch(host, &run_id, task_file, "bypassPermissions")
+                    .context("headless launch failed")?;
+                // Wait for the protocol-level ack (system/init) before
+                // declaring delivery — no screen scraping.
+                let mut delivered = false;
+                for _ in 0..30 {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    if headless::confirm_start(host, &run_id) {
+                        delivered = true;
+                        break;
+                    }
+                }
+                let ledger_c = ledger::open()?;
+                ledger::record_dispatch(&ledger_c, "headless", &run_id, None)?;
+                println!(
+                    "HEADLESS {run_id} | {} | stream: /tmp/fleetd-runs/{run_id}/stream.jsonl",
+                    if delivered { "DELIVERED" } else { "NO-INIT (poll: fleetd watch)" }
+                );
+            } else {
+                dispatch(cfg.as_ref().context("config required")?, task_file, repo)?;
+            }
+        }
+        // --- headless run observability: tail the event stream ---
+        Some("watch") => {
+            let run_id = args.get(2).context("usage: fleetd watch <run-id> [--host <alias>] [lines]")?;
+            let host = args
+                .iter()
+                .position(|a| a == "--host")
+                .and_then(|i| args.get(i + 1))
+                .map(String::as_str)
+                .unwrap_or("local");
+            let lines: usize = args
+                .get(3)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(20);
+            match headless::poll_state(host, run_id) {
+                headless::RunState::Finished(sub) => println!("state: FINISHED result={sub}"),
+                headless::RunState::Working => println!("state: WORKING"),
+                headless::RunState::NotStarted => println!("state: NOT-STARTED"),
+            }
+            print!("{}", headless::tail(host, run_id, lines));
         }
         // --- event plane (completion callbacks) ---
         Some("event") => {
