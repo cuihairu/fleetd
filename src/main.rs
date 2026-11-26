@@ -898,7 +898,15 @@ fn main() -> Result<()> {
                 .position(|a| a == "--port")
                 .and_then(|i| args.get(i + 1))
                 .and_then(|p| p.parse().ok())
-                .unwrap_or(3790);
+                .unwrap_or(3790u16);
+            // Tray status line (2026-11-27 用户令「右键能看状态」): version +
+            // port + mode, so the menu's first row is the live fact.
+            #[cfg(target_os = "windows")]
+            crate::tray::set_status(format!(
+                "fleetd {} — hub :{}",
+                env!("CARGO_PKG_VERSION"),
+                port
+            ));
             // background scheduler thread — same daemon, user-space, no root.
             if !args.iter().any(|a| a == "--no-scheduler") {
                 std::thread::spawn(|| {

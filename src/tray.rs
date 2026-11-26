@@ -14,9 +14,11 @@
 
 #![cfg(target_os = "windows")]
 
+use std::os::windows::process::CommandExt;
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 
-use windows_sys::Win32::Foundation::HWND;
+use windows_sys::Win32::Foundation::{HWND, POINT};
 use windows_sys::Win32::Graphics::Gdi::{
     CreateBitmap, CreateDIBSection, DeleteObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
     DIB_RGB_COLORS, HGDIOBJ,
@@ -27,9 +29,12 @@ use windows_sys::Win32::UI::Shell::{
     NOTIFYICONDATAW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateIconIndirect, CreateWindowExW, DefWindowProcW, DestroyIcon, DispatchMessageW,
-    GetMessageW, KillTimer, PostQuitMessage, RegisterClassExW, SetTimer, TranslateMessage,
-    HICON, ICONINFO, MSG, WNDCLASSEXW, WM_DESTROY, WM_TIMER,
+    AppendMenuW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
+    DestroyIcon, DestroyMenu, DispatchMessageW, GetMessageW, GetCursorPos, KillTimer,
+    PostQuitMessage, RegisterClassExW, SetForegroundWindow, SetTimer, TrackPopupMenu,
+    TranslateMessage, HICON, HMENU, ICONINFO, MF_DISABLED, MF_SEPARATOR, MF_STRING, MSG,
+    TPM_BOTTOMALIGN, TPM_RIGHTBUTTON, WNDCLASSEXW, WM_COMMAND, WM_DESTROY, WM_RBUTTONUP,
+    WM_TIMER,
 };
 
 const WIDTH: u32 = 64;
@@ -44,6 +49,58 @@ const WM_APP: u32 = 0x8000;
 
 static G_NID: AtomicIsize = AtomicIsize::new(0);
 static G_EXIT: AtomicBool = AtomicBool::new(false);
+
+// --- Right-click menu (2026-11-27 用户令「右键能看状态」) -------------------
+// Status line lives in a global set by the serve thread (UTF-16 ready);
+// menu ids are small consts so WM_COMMAND can act on them.
+const MENU_STATUS: usize = 100;
+const MENU_OPEN_PANEL: usize = 101;
+const MENU_QUIT: usize = 102;
+
+/// Status text shown as the disabled first row of the menu, e.g.
+/// "fleetd 0.1.0 — hub :3790". Written by serve before the menu opens.
+static G_STATUS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+pub fn set_status(line: String) {
+    if let Ok(mut slot) = G_STATUS.lock() {
+        *slot = Some(line);
+    }
+}
+
+fn utf16(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// Build the context menu. Returns (menu, handled); caller destroys the menu.
+unsafe fn build_menu() -> HMENU {
+    let menu = CreatePopupMenu();
+    if menu.is_null() {
+        return std::ptr::null_mut();
+    }
+    let status = G_STATUS
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())
+        .unwrap_or_else(|| "fleetd — running".into());
+    let wide = utf16(&status);
+    AppendMenuW(menu, MF_DISABLED, 0, wide.as_ptr());
+    AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
+    let open_label = utf16("打开面板 (fleet overview)");
+    AppendMenuW(menu, MF_STRING, MENU_OPEN_PANEL, open_label.as_ptr());
+    let quit_label = utf16("退出 fleetd");
+    AppendMenuW(menu, MF_STRING, MENU_QUIT, quit_label.as_ptr());
+    menu
+}
+
+/// Shell out to open the fleet overview page in the default browser.
+fn open_panel() {
+    let url = std::env::var("FLEETD_PANEL_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:3790/v1/fleet/summary".into());
+    let _ = Command::new("cmd")
+        .args(["/C", "start", "", &url])
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+        .spawn();
+}
 
 /// One frame's raw RGBA pixels (top-down rows, as PIL writes them).
 pub fn frame(idx: usize) -> &'static [u8] {
@@ -122,6 +179,41 @@ unsafe extern "system" fn tray_wnd_proc(
                         DestroyIcon(old);
                     }
                 }
+            }
+            0
+        }
+        // Tray icon callback: low word of lparam = mouse message.
+        m if m == WM_APP + 1 && (lparam as u32 & 0xffff) == WM_RBUTTONUP => {
+            // Foreground trick: the menu needs its owner window foreground or
+            // it won't dismiss on outside click (classic Shell_NotifyIcon quirk).
+            SetForegroundWindow(hwnd);
+            let menu = build_menu();
+            if !menu.is_null() {
+                let mut pt = POINT { x: 0, y: 0 };
+                GetCursorPos(&mut pt);
+                TrackPopupMenu(
+                    menu,
+                    TPM_RIGHTBUTTON | TPM_BOTTOMALIGN,
+                    pt.x,
+                    pt.y,
+                    0,
+                    hwnd,
+                    std::ptr::null(),
+                );
+                DestroyMenu(menu);
+            }
+            0
+        }
+        WM_COMMAND => {
+            match wparam & 0xffff {
+                MENU_OPEN_PANEL => open_panel(),
+                MENU_QUIT => {
+                    G_EXIT.store(true, Ordering::SeqCst);
+                    // Ask the whole process to leave: tray is advisory only,
+                    // and the user clicked Quit — serve should shut down.
+                    std::process::exit(0);
+                }
+                _ => {}
             }
             0
         }
