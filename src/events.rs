@@ -102,6 +102,18 @@ pub fn handle_stream(stream: &mut TcpStream) -> Result<()> {
             Ok(v) => (200, format!(r#"{{"verdict":"{}"}}"#, v)),
             Err(e) => (400, format!(r#"{{"error":"{}"}}"#, e)),
         },
+        // Read-only fleet summary for remote dashboards (2026-11-27).
+        // No auth in step 1: bind is loopback by default; token lands with
+        // the public relay face (relay-design F5).
+        Some("GET") if request_line.contains("/v1/fleet/summary") => {
+            match crate::summary::build(7) {
+                Ok(s) => match serde_json::to_string(&s) {
+                    Ok(j) => (200, j),
+                    Err(e) => (500, format!(r#"{{"error":"{}"}}"#, e)),
+                },
+                Err(e) => (500, format!(r#"{{"error":"{}"}}"#, e)),
+            }
+        }
         _ => (404, r#"{"error":"not found"}"#.to_string()),
     };
     let resp = format!(

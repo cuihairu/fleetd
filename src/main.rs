@@ -2,6 +2,7 @@ mod agent;
 mod config;
 mod dispatcher;
 mod events;
+mod fleet_view;
 // Headless dispatch channel (2026-11-27): spawn `claude -p` per task, JSONL
 // event stream as the source of truth; tmux demoted to debug surface.
 mod headless;
@@ -10,6 +11,7 @@ mod jobs;
 mod mcp_server;
 mod probe;
 mod resources;
+mod summary;
 mod topology;
 
 // Windows tray (wood gear, rotating frames); compiled only on windows targets.
@@ -407,6 +409,15 @@ fn main() -> Result<()> {
         Some("fleet") => {
             let t = topology::Topology::load()?;
             match args.get(2).map(String::as_str) {
+                // Remote overview: fleetd fleet overview <hub-url> [--follow]
+                Some("overview") => {
+                    let hub = args
+                        .get(3)
+                        .context("usage: fleetd fleet overview <hub-url> [--follow]")?
+                        .clone();
+                    let follow = args.iter().any(|a| a == "--follow");
+                    fleet_view::run(&hub, follow).map_err(|e| anyhow::anyhow!(e))?;
+                }
                 Some("ships") => {
                     println!("self ship = {}{}", t.ship.name, if t.is_hub() { " (HUB)" } else { "" });
                     for s in &t.fleet.ships {
