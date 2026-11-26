@@ -5,6 +5,9 @@ mod events;
 mod ledger;
 mod jobs;
 mod mcp_server;
+mod probe;
+mod resources;
+mod topology;
 mod scheduler;
 
 use anyhow::{bail, Context, Result};
@@ -329,7 +332,18 @@ fn main() -> Result<()> {
         .iter()
         .position(|a| a == "--config")
         .map(|i| PathBuf::from(&args[i + 1]));
-    let cfg = FleetConfig::load(cfg_path)?;
+    // Host config is only required by commands that dispatch across hosts.
+    // Ship-local commands (event/mcp/init/job/fleet) must work without it —
+    // a remote ship has no ~/.hermes/fleet.toml and still must come up.
+    let needs_hosts = matches!(
+        args.get(1).map(String::as_str),
+        Some("status") | Some("hosts") | Some("cleanup") | Some("dispatch") | None
+    );
+    let cfg = if needs_hosts {
+        Some(FleetConfig::load(cfg_path)?)
+    } else {
+        None
+    };
 
     match args.get(1).map(String::as_str) {
         // --- user-space job scheduler ---
@@ -360,6 +374,90 @@ fn main() -> Result<()> {
                 _ => println!("fleetd job: add <name> <schedule> <cmd> | list | run <name> | enable|disable <name> | remove <name> | stats [name]"),
             }
         }
+        // --- fleet aggregation (hub role): pull ship ledgers, whole-fleet view ---
+        Some("fleet") => {
+            let t = topology::Topology::load()?;
+            match args.get(2).map(String::as_str) {
+                Some("ships") => {
+                    println!("self ship = {}{}", t.ship.name, if t.is_hub() { " (HUB)" } else { "" });
+                    for s in &t.fleet.ships {
+                        println!("  ship {} via ssh {}", s.name, s.ssh);
+                    }
+                }
+                Some("pull") => {
+                    for s in &t.fleet.ships {
+                        let path = topology::pull_ship_ledger(&s.ssh, &s.name)?;
+                        println!("pulled {} -> {}", s.name, path.display());
+                    }
+                }
+                Some("status") => {
+                    // aggregate dispatch rows from self + pulled ship ledgers
+                    let mut total_fired: i64 = 0;
+                    let mut total_stalled: i64 = 0;
+                    let c = ledger::open()?;
+                    for r in ledger::progress(&c, 1)? {
+                        total_fired += r.fired;
+                        total_stalled += r.stalled;
+                    }
+                    let ships_dir = dirs::home_dir().expect("home").join(".fleetd/ships");
+                    if let Ok(entries) = std::fs::read_dir(&ships_dir) {
+                        for e in entries.flatten() {
+                            let path = e.path();
+                            if path.extension().map(|x| x == "db").unwrap_or(false) {
+                                if let Ok(rc) = rusqlite::Connection::open(&path) {
+                                    for r in ledger::progress(&rc, 1).unwrap_or_default() {
+                                        total_fired += r.fired;
+                                        total_stalled += r.stalled;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    println!("FLEET: fired={} stalled={} (self + pulled ships)", total_fired, total_stalled);
+                }
+                _ => println!("fleetd fleet: ships | pull | status"),
+            }
+        }
+        // --- resource plane (hosts/tools/devices facts) ---
+        Some("resources") => {
+            let c = ledger::open()?;
+            match args.get(2).map(String::as_str) {
+                Some("probe") => {
+                    // fleetd resources probe [host...] — default: config hosts
+                    let hosts: Vec<String> = match args.get(3) {
+                        Some(_) => args[3..].to_vec(),
+                        None => cfg.as_ref().context("config required")?.hosts.iter().map(|h| h.name.clone()).collect(),
+                    };
+                    for h in &hosts {
+                        let (t, d) = probe::probe_all(&c, h)?;
+                        println!("{h}: tools={t} devices={d}");
+                    }
+                }
+                Some("list") => {
+                    let kind = args.get(3).and_then(|k| resources::ResourceKind::from_str(k));
+                    let host = args.get(4).map(String::as_str);
+                    let rows = resources::query(&c, kind, host)?;
+                    println!("{:<10} {:<12} {:<22} {:<10} {:<8} {}", "kind", "host", "name", "state", "holder", "detail");
+                    for r in rows {
+                        println!("{:<10} {:<12} {:<22} {:<10} {:<8} {}", r.kind, r.host, r.name, r.state, r.holder, r.detail);
+                    }
+                }
+                Some("claim") => {
+                    let host = args.get(3).context("usage: fleetd resources claim <host> <device> <holder>")?;
+                    let dev = args.get(4).context("usage: fleetd resources claim <host> <device> <holder>")?;
+                    let holder = args.get(5).context("usage: fleetd resources claim <host> <device> <holder>")?;
+                    let ok = resources::claim_device(&c, host, dev, holder)?;
+                    println!("{host}/{dev}: {}", if ok { "claimed" } else { "NOT claimable (busy/offline/missing)" });
+                }
+                Some("release") => {
+                    let host = args.get(3).context("usage: fleetd resources release <host> <device>")?;
+                    let dev = args.get(4).context("usage: fleetd resources release <host> <device>")?;
+                    let ok = resources::release_device(&c, host, dev)?;
+                    println!("{host}/{dev}: {}", if ok { "released" } else { "not found" });
+                }
+                _ => println!("fleetd resources: probe [host...] | list [kind] [host] | claim <host> <device> <holder> | release <host> <device>"),
+            }
+        }
         // --- MCP server for coding agents (stdio) ---
         Some("mcp") => {
             // blocks until the client disconnects; needs an async runtime
@@ -377,7 +475,7 @@ fn main() -> Result<()> {
                 c.query_row("SELECT COUNT(*) FROM seats", [], |r| r.get(0)).unwrap_or(0));
         }
         Some("status") => {
-            status(&cfg)?;
+            status(cfg.as_ref().context("config required")?)?;
             // Event-plane progress panel (SQLite-backed, survives restarts)
             let c = ledger::open()?;
             let rows = ledger::progress(&c, 1)?;
@@ -395,8 +493,8 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Some("hosts") => hosts(&cfg)?,
-        Some("cleanup") => cleanup(&cfg)?,
+        Some("hosts") => hosts(cfg.as_ref().context("config required")?)?,
+        Some("cleanup") => cleanup(cfg.as_ref().context("config required")?)?,
         Some("dispatch") => {
             let task_file = args
                 .get(2)
@@ -404,7 +502,7 @@ fn main() -> Result<()> {
             let repo = args
                 .get(3)
                 .context("usage: fleetd dispatch <task.md> <repo>")?;
-            dispatch(&cfg, task_file, repo)?;
+            dispatch(cfg.as_ref().context("config required")?, task_file, repo)?;
         }
         // --- event plane (completion callbacks) ---
         Some("event") => {
@@ -441,7 +539,7 @@ fn main() -> Result<()> {
         }
         _ => {
             println!("fleetd: status | hosts | cleanup | dispatch <task.md> <repo> | event <seat> | serve");
-            status(&cfg)?;
+            status(cfg.as_ref().context("config required")?)?;
         }
     }
     Ok(())
