@@ -421,6 +421,7 @@ fn main() -> Result<()> {
         // --- resource plane (hosts/tools/devices facts) ---
         Some("resources") => {
             let c = ledger::open()?;
+            resources::init(&c).context("init resources table")?;
             match args.get(2).map(String::as_str) {
                 Some("probe") => {
                     // fleetd resources probe [host...] — default: config hosts
