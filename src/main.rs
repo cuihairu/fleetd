@@ -19,6 +19,7 @@ mod topology;
 
 // Windows tray (wood gear, rotating frames); compiled only on windows targets.
 #[cfg(target_os = "windows")]
+mod scm_service;
 mod tray;
 
 // Embedded CPython (PyO3): linux flagship links system libpython; windows seats
@@ -362,6 +363,15 @@ fn dispatch(cfg: &FleetConfig, task_file: &str, repo: &str) -> Result<()> {
 }
 
 fn main() -> Result<()> {
+    // SCM dispatch: when started by the Windows service controller
+    // (`sc start FleetD` → binPath has --service), main must hand control to
+    // the service dispatcher immediately or the 30 s start clock kills us
+    // (error 1053, observed live 2026-11-27).
+    #[cfg(target_os = "windows")]
+    if std::env::args().any(|a| a == "--service") {
+        scm_service::run().map_err(|e| anyhow::anyhow!("service error: {e:?}"))?;
+        return Ok(());
+    }
     let args: Vec<String> = std::env::args().collect();
     let cfg_path = args
         .iter()
@@ -946,26 +956,7 @@ fn main() -> Result<()> {
             // 「tray 和 serve 拆开」): serve never spawns it; the OS service
             // face (FleetDTray ONLOGON / launchd agent) launches `fleetd tray`
             // in the interactive session. Serve headless always.
-            // fleetd serve [--port 3790] [--no-scheduler]
-            let port = args
-                .iter()
-                .position(|a| a == "--port")
-                .and_then(|i| args.get(i + 1))
-                .and_then(|p| p.parse().ok())
-                .unwrap_or(3790u16);
-            // Tray pulls its status over /v1/status (separate process) —
-            // serve has nothing to do with the tray face anymore.
-            // background scheduler thread — same daemon, user-space, no root.
-            if !args.iter().any(|a| a == "--no-scheduler") {
-                std::thread::spawn(|| {
-                    crate::scheduler::serve(|| {
-                        let c = crate::ledger::open()?;
-                        crate::jobs::tick(&c)
-                    });
-                });
-            }
-            let bind = if args.iter().any(|a| a == "--public") { "0.0.0.0" } else { "127.0.0.1" };
-            events::serve_on(bind, port)?;
+            run_serve_cli(&args)?;
         }
         _ => {
             println!("fleetd: status | hosts | cleanup | dispatch <task.md> <repo> | event <seat> | serve");
@@ -973,4 +964,44 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+
+/// CLI serve path: flags respected (`--port`, `--public`, `--no-scheduler`).
+fn run_serve_cli(args: &[String]) -> Result<()> {
+    let port = args
+        .iter()
+        .position(|a| a == "--port")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(3790u16);
+    if !args.iter().any(|a| a == "--no-scheduler") {
+        std::thread::spawn(|| {
+            crate::scheduler::serve(|| {
+                let c = crate::ledger::open()?;
+                crate::jobs::tick(&c)
+            });
+        });
+    }
+    let bind = if args.iter().any(|a| a == "--public") { "0.0.0.0" } else { "127.0.0.1" };
+    events::serve_on(bind, port)?;
+    Ok(())
+}
+
+/// SCM path (windows, `--service` arg from `sc create`): fixed flags —
+/// scheduler on, loopback bind (the service IS the flagship).
+#[cfg(target_os = "windows")]
+pub fn run_serve_from_service() -> anyhow::Result<()> {
+    let args = vec![
+        "fleetd".to_string(),
+        "serve".to_string(),
+        "--port".to_string(),
+        "3790".to_string(),
+    ];
+    run_serve_cli(&args)
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn run_serve_from_service() -> anyhow::Result<()> {
+    anyhow::bail!("SCM service face is windows-only")
 }
