@@ -117,11 +117,13 @@ fn find_double_crlf(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
-/// Serve events forever on a loopback port. Blocks the caller.
-pub fn serve(port: u16) -> Result<()> {
+/// Serve events forever on `bind_addr`. Blocks the caller. Pass "127.0.0.1"
+/// for the loopback-only default, or "0.0.0.0" when agents reach the hub
+/// over the network (fleetd agent pull mode / dev public relay).
+pub fn serve_on(bind_addr: &str, port: u16) -> Result<()> {
     let listener =
-        TcpListener::bind(("127.0.0.1", port)).with_context(|| format!("bind 127.0.0.1:{port}"))?;
-    eprintln!("fleetd event endpoint: http://127.0.0.1:{port}/v1/events");
+        TcpListener::bind((bind_addr, port)).with_context(|| format!("bind {bind_addr}:{port}"))?;
+    eprintln!("fleetd event endpoint: http://{bind_addr}:{port}/v1/events");
     for stream in listener.incoming() {
         match stream {
             Ok(mut s) => {

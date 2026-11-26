@@ -25,4 +25,5 @@ dirs = "5"
 pyo3 = { version = "0.30", features = ["auto-initialize"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
+pyo3 = { version = "0.30", features = ["auto-initialize", "abi3-py310"] }
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_System_LibraryLoader", "Win32_Graphics_Gdi"] }

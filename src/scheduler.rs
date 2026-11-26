@@ -179,14 +179,26 @@ pub fn run_command(command: &str) -> Result<(i32, String)> {
         }
         #[cfg(target_os = "windows")]
         {
-            use std::process::Command;
-            let output = Command::new("python").arg(command).output()
-                .with_context(|| format!("spawn system python for {command}"))?;
-            let mut text = String::new();
-            text.push_str(&String::from_utf8_lossy(&output.stdout));
-            text.push_str(&String::from_utf8_lossy(&output.stderr));
-            let code = output.status.code().unwrap_or(-1);
-            return finish(code, &text);
+            // Same embedded interpreter as the hub (abi3 + bundled runtime/);
+            // fall back to the system python subprocess when the interpreter
+            // cannot start (missing python3.dll and no bundle).
+            match crate::pyhost::run_source(&std::fs::read_to_string(command)
+                .with_context(|| format!("read python job {command}"))?)
+            {
+                Ok(stdout) => return finish(0, &stdout),
+                Err(e) => {
+                    // Embedded path failed: try system python as last resort.
+                    use std::process::Command;
+                    if let Ok(output) = Command::new("python").arg(command).output() {
+                        let mut text = String::new();
+                        text.push_str(&String::from_utf8_lossy(&output.stdout));
+                        text.push_str(&String::from_utf8_lossy(&output.stderr));
+                        let code = output.status.code().unwrap_or(-1);
+                        return finish(code, &text);
+                    }
+                    return finish(1, &format!("{e:#}"));
+                }
+            }
         }
         #[cfg(not(any(target_os = "linux", target_os = "windows")))]
         {
@@ -213,7 +225,7 @@ where
 {
     // Boot the embedded interpreter so `.py` jobs have `import fleetd`.
     // (The real LedgerApi adapter lands with the MCP exposure step.)
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     {
         struct NoopApi;
         impl crate::pyhost::FleetdApi for NoopApi {

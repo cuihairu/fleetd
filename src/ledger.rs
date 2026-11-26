@@ -90,6 +90,13 @@ pub fn open() -> Result<Connection> {
          );
          CREATE INDEX IF NOT EXISTS idx_dispatch_seat ON dispatches(seat, fired_at DESC);",
     )?;
+    // Seat-control gate migration (2026-11-26 falcon incident): disabled
+    // seats must be skipped by every auto-start path. ALTER with tolerance
+    // for already-migrated databases.
+    for col in ["stopped_by TEXT", "stopped_at INTEGER"] {
+        let sql = format!("ALTER TABLE seats ADD COLUMN {col};");
+        let _ = c.execute_batch(&sql); // duplicate-column errors are fine
+    }
     Ok(c)
 }
 
@@ -160,6 +167,33 @@ impl Verdict {
             Verdict::Untracked => "untracked",
         }
     }
+}
+
+/// Seat-control gate: a disabled seat must be skipped by every auto-start
+/// path (idle-watch, fire, agent heartbeat, patrol resume). Set by
+/// `seat stop`/`seat disable`, cleared only by `seat enable`.
+pub fn is_disabled(c: &Connection, seat: &str) -> Result<bool> {
+    let mut st = c.prepare("SELECT status FROM seats WHERE seat = ?1")?;
+    let status: Option<String> = st.query_row([seat], |r| r.get(0)).optional()?;
+    Ok(status.as_deref() == Some("disabled"))
+}
+
+/// Write the gate without touching the session/process (soft stop).
+pub fn set_gate(c: &Connection, seat: &str, disabled: bool, by: &str) -> Result<()> {
+    let status = if disabled { "disabled" } else { "idle" };
+    let now = chrono::Utc::now().timestamp();
+    c.execute(
+        "UPDATE seats SET status = ?2, stopped_by = ?3, stopped_at = ?4, updated_at = ?4
+         WHERE seat = ?1",
+        rusqlite::params![seat, status, by, now],
+    )?;
+    // ensure row exists even if the seat was never seen before
+    c.execute(
+        "INSERT OR IGNORE INTO seats (seat, cwd, status, stopped_by, stopped_at, updated_at)
+         VALUES (?1, '', ?2, ?3, ?4, ?4)",
+        rusqlite::params![seat, status, by, now],
+    )?;
+    Ok(())
 }
 
 /// In-flight dispatch for a seat (tag + baseline), if any.

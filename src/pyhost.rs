@@ -18,7 +18,11 @@
 //! process. Registration injects the module into `sys` and `builtins` so a
 //! bare `import fleetd` resolves.
 
-#![cfg(target_os = "linux")]
+// Compiled on every fleetd target: linux hub links the system libpython,
+// windows seats link python3.dll (abi3) and expect the bundled `runtime/`
+// directory next to the exe (python3.dll + python315.dll + DLLs/ + Lib/).
+// Three-tier fallback at init: bundled runtime -> system python3.dll ->
+// caller runs `.py` jobs via the system python subprocess instead.
 
 use anyhow::{Context, Result};
 use pyo3::prelude::*;
@@ -51,11 +55,11 @@ static MODULE: std::sync::OnceLock<pyo3::Py<pyo3::types::PyModule>> = std::sync:
 /// Safe to call multiple times (subsequent calls are no-ops). With the
 /// `auto-initialize` feature, the first `Python::attach` boots CPython.
 pub fn init(api: Box<dyn FleetdApi>) -> Result<()> {
-    // Store the concrete value, not the boxed trait (OnceLock<Box<dyn T>>
-    // derefs to &dyn T only through the box; keep one canonical shape).
     if API.set(api).is_err() {
         return Ok(()); // already initialized
     }
+    #[cfg(target_os = "windows")]
+    configure_bundled_runtime();
     Python::attach(|py| -> PyResult<()> {
         let module = PyModule::new(py, "fleetd")?;
         module.add_function(wrap_pyfunction!(fleetd_log, &module)?)?;
@@ -128,6 +132,38 @@ fn fleetd_jobs() -> Vec<(String, String, bool)> {
 fn fleetd_run_job(name: &str) -> PyResult<i32> {
     api().run_job(name)
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+}
+
+/// Windows: point the interpreter at the bundled `runtime/` directory next
+/// to the exe (python3.dll + DLLs/ + Lib/). No-op when the bundle is absent
+/// (then python3.dll must come from PATH, or init fails and the scheduler
+/// falls back to the system-python subprocess path).
+#[cfg(target_os = "windows")]
+fn configure_bundled_runtime() {
+    use std::path::PathBuf;
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let runtime = exe.parent().map(|d| d.join("runtime"));
+    let Some(runtime) = runtime else { return };
+    if !runtime.join("python3.dll").exists() {
+        return; // no bundle: let the loader resolve python3.dll from PATH
+    }
+    // DLL search: put runtime/ first so python3.dll is found without PATH games.
+    // PYTHONHOME/PYTHONPATH teach the interpreter where Lib/ lives.
+    unsafe {
+        // SetDllDirectoryA: kernel32; keep the signature simple.
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn SetDllDirectoryA(path: *const u8) -> i32;
+        }
+        let mut c: Vec<u8> = runtime.as_os_str().to_string_lossy().bytes().collect();
+        c.push(0);
+        SetDllDirectoryA(c.as_ptr());
+    }
+    std::env::set_var("PYTHONHOME", &runtime);
+    std::env::set_var("PYTHONPATH", runtime.join("Lib"));
 }
 
 #[cfg(test)]

@@ -13,9 +13,9 @@ mod topology;
 #[cfg(target_os = "windows")]
 mod tray;
 
-// Embedded CPython (PyO3) for .py jobs on the hub; Windows seats use the
-// system Python (see scheduler::run_command).
-#[cfg(target_os = "linux")]
+// Embedded CPython (PyO3): linux hub links system libpython; windows seats
+// link python3.dll (abi3) and use the bundled runtime/ directory. See pyhost.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 mod pyhost;
 mod scheduler;
 
@@ -428,6 +428,53 @@ fn main() -> Result<()> {
             }
         }
         // --- resource plane (hosts/tools/devices facts) ---
+        Some("seat") => {
+            // seat stop|disable|enable|list — absolute control over claude
+            // seats (falcon incident 2026-11-26: stop must kill session,
+            // processes AND write a gate no auto-start path may bypass).
+            let c = ledger::open()?;
+            match args.get(2).map(String::as_str) {
+                Some("stop") | Some("disable") => {
+                    let name = args.get(3).context("usage: fleetd seat stop <name>")?;
+                    let hard = args.get(2) == Some(&"stop".to_string());
+                    if hard {
+                        // Layer 1: session
+                        let _ = std::process::Command::new("tmux")
+                            .args(["kill-session", "-t", name])
+                            .output();
+                        // Layer 2: processes living in the seat workdir
+                        let _ = std::process::Command::new("pkill")
+                            .args(["-f", &format!("workspaces/{name}")])
+                            .output();
+                    }
+                    // Layer 3: gate
+                    ledger::set_gate(&c, name, true, "user")?;
+                    println!("{name}: {} + gate=disabled", if hard { "session+procs killed" } else { "gate only" });
+                }
+                Some("enable") => {
+                    let name = args.get(3).context("usage: fleetd seat enable <name>")?;
+                    ledger::set_gate(&c, name, false, "user")?;
+                    println!("{name}: gate cleared (idle)");
+                }
+                Some("list") => {
+                    let mut st = c.prepare(
+                        "SELECT seat, status, stopped_by FROM seats ORDER BY seat")?;
+                    let rows = st.query_map([], |r| {
+                        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?))
+                    })?;
+                    for r in rows {
+                        let (seat, status, by) = r?;
+                        let gate = if status == "disabled" { " [GATED]" } else { "" };
+                        println!("{seat:20} {status}{gate}{}", by.map(|b| format!(" by={b}")).unwrap_or_default());
+                    }
+                }
+                Some("gate-check") => {
+                    let name = args.get(3).context("usage: fleetd seat gate-check <name>")?;
+                    println!("{}", if ledger::is_disabled(&c, name)? { "DISABLED" } else { "ALLOWED" });
+                }
+                _ => println!("usage: fleetd seat stop|disable|enable|list|gate-check [name]"),
+            }
+        }
         Some("resources") => {
             let c = ledger::open()?;
             resources::init(&c).context("init resources table")?;
@@ -553,7 +600,8 @@ fn main() -> Result<()> {
                     });
                 });
             }
-            events::serve(port)?;
+            let bind = if args.iter().any(|a| a == "--public") { "0.0.0.0" } else { "127.0.0.1" };
+            events::serve_on(bind, port)?;
         }
         _ => {
             println!("fleetd: status | hosts | cleanup | dispatch <task.md> <repo> | event <seat> | serve");
