@@ -24,6 +24,7 @@ mod tray;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 mod pyhost;
 mod scheduler;
+mod service;
 
 use anyhow::{bail, Context, Result};
 use config::{FleetConfig, Host};
@@ -682,6 +683,83 @@ fn main() -> Result<()> {
                 );
             } else {
                 dispatch(cfg.as_ref().context("config required")?, task_file, repo)?;
+            }
+        }
+        // --- self service registration (per-OS native mechanism) ---
+        Some("service") => {
+            let exe = std::env::current_exe()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "fleetd".into());
+            match args.get(2).map(String::as_str) {
+                Some("install") | Some("uninstall") => {
+                    let uninstall = args.get(2).map(String::as_str) == Some("uninstall");
+                    match service::detect() {
+                        service::Platform::Linux => {
+                            let unit_path = format!(
+                                "{}/.config/systemd/user/fleetd.service",
+                                std::env::var("HOME").unwrap_or_default()
+                            );
+                            if uninstall {
+                                let _ = Command::new("systemctl").args(["--user", "stop", "fleetd"]).output();
+                                let _ = std::fs::remove_file(&unit_path);
+                                let _ = Command::new("systemctl").args(["--user", "daemon-reload"]).output();
+                                println!("linux: unit removed");
+                            } else {
+                                std::fs::create_dir_all(
+                                    std::path::Path::new(&unit_path).parent().unwrap()
+                                )?;
+                                std::fs::write(&unit_path, service::systemd_unit(&exe))?;
+                                let _ = Command::new("systemctl").args(["--user", "daemon-reload"]).output();
+                                let en = Command::new("systemctl")
+                                    .args(["--user", "enable", "--now", "fleetd"])
+                                    .output()?;
+                                println!(
+                                    "linux: unit written to {unit_path}, enable --now = {}",
+                                    en.status.success()
+                                );
+                            }
+                        }
+                        service::Platform::Windows => {
+                            let tn = if uninstall { "/Delete" } else { "/Create" };
+                            for task in ["FleetD", "FleetDTray"] {
+                                if uninstall {
+                                    let _ = Command::new("schtasks")
+                                        .args(["/Delete", "/TN", task, "/F"])
+                                        .output();
+                                } else {
+                                    for c in service::windows_commands(&exe) {
+                                        if c.contains(task) {
+                                            let _ = Command::new("cmd").args(["/c", &c]).output();
+                                        }
+                                    }
+                                }
+                            }
+                            let _ = tn;
+                            println!("windows: tasks {} done", if uninstall { "deleted" } else { "created" });
+                        }
+                        service::Platform::Macos => {
+                            let plist = format!(
+                                "{}/Library/LaunchAgents/ai.fleetd.plist",
+                                std::env::var("HOME").unwrap_or_default()
+                            );
+                            if uninstall {
+                                let _ = Command::new("launchctl").args(["unload", &plist]).output();
+                                let _ = std::fs::remove_file(&plist);
+                                println!("macos: plist unloaded+removed");
+                            } else {
+                                std::fs::create_dir_all(
+                                    std::path::Path::new(&plist).parent().unwrap()
+                                )?;
+                                std::fs::write(&plist, service::launchd_plist(&exe))?;
+                                let l = Command::new("launchctl").args(["load", &plist]).output()?;
+                                println!("macos: plist loaded = {}", l.status.success());
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    println!("usage: fleetd service install | service uninstall");
+                }
             }
         }
         // --- agent toolchain lifecycle: install/inventory across hosts ---
