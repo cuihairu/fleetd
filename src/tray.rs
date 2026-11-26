@@ -41,11 +41,25 @@ const WIDTH: u32 = 64;
 const HEIGHT: u32 = 64;
 const FRAME_LEN: usize = (WIDTH as usize) * (HEIGHT as usize) * 4;
 const FRAME_COUNT: usize = 24;
-const FRAME_MS: u32 = 150;
 const FRAME_DATA: &[u8] = include_bytes!("tray_frames/frames.bin");
 
 const TIMER_ID: usize = 1;
 const WM_APP: u32 = 0x8000;
+
+/// Rotation cadence by in-flight dispatch count (2026-11-27 用户令「任务越多
+/// 转动越快，最快也要看得清」): 0 tasks = idle drift (1.2 s/frame), each
+/// running task speeds the gear up, clamped at 400 ms/frame (2.5 rev/min —
+/// clearly readable, never a blur). The WM_TIMER tick re-arms itself with the
+/// current cadence, so the speed tracks live load with no extra thread.
+fn cadence_ms(in_flight: i64) -> u32 {
+    if in_flight <= 0 {
+        1200
+    } else {
+        // 1 task = 800 ms, 2 = 600, 3 = 480 ... floor at 400 ms so the
+        // rotation always stays legible to a human eye.
+        (800 / in_flight).max(400) as u32
+    }
+}
 
 static G_NID: AtomicIsize = AtomicIsize::new(0);
 static G_EXIT: AtomicBool = AtomicBool::new(false);
@@ -180,6 +194,12 @@ unsafe extern "system" fn tray_wnd_proc(
                     }
                 }
             }
+            // Re-arm at the live-load cadence: more in-flight dispatches =
+            // faster gear (用户令「任务越多转动越快」). Ledger errors read as
+            // idle — the tray must never die because the db hiccuped.
+            let busy = std::panic::catch_unwind(crate::ledger::in_flight_count)
+                .unwrap_or(0);
+            SetTimer(hwnd, TIMER_ID, cadence_ms(busy), None);
             0
         }
         // Tray icon callback: low word of lparam = mouse message.
@@ -280,7 +300,7 @@ pub fn spawn() -> Option<StopHandle> {
             Shell_NotifyIconW(NIM_ADD, &nid);
             G_NID.store(&mut nid as *mut _ as isize, Ordering::SeqCst);
 
-            SetTimer(hwnd, TIMER_ID, FRAME_MS, None);
+            SetTimer(hwnd, TIMER_ID, 1200, None); // start idle; first tick re-arms by load
 
             // Message loop: serves the timer and keeps the window alive.
             let mut msg: MSG = std::mem::zeroed();
@@ -333,6 +353,16 @@ mod tests {
             .filter(|(a, b)| a != b)
             .count();
         assert!(diff > 100, "rotation must change pixels ({diff} bytes)");
+    }
+
+    #[test]
+    fn cadence_speeds_up_with_load_and_clamps() {
+        assert_eq!(cadence_ms(0), 1200); // idle drift
+        assert_eq!(cadence_ms(1), 800);
+        assert_eq!(cadence_ms(2), 400);
+        assert_eq!(cadence_ms(3), 400); // 800/3=266 → clamp 400
+        assert_eq!(cadence_ms(50), 400); // clamp: never faster than legible
+        assert_eq!(cadence_ms(-3), 1200); // negative reads as idle
     }
 
     #[test]

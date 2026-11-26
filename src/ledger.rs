@@ -507,3 +507,18 @@ mod tests {
         assert_eq!(rows[0].stalled, 1);
     }
 }
+
+/// Dispatches fired but not yet finished — the "is fleetd working" signal
+/// that drives the tray rotation speed (2026-11-27 用户令:跑任务时 icon 缓转).
+pub fn in_flight_count() -> i64 {
+    let c = match open() {
+        Ok(c) => c,
+        Err(_) => return 0,
+    };
+    c.query_row(
+        "SELECT COUNT(*) FROM dispatches WHERE finished_at IS NULL",
+        [],
+        |r| r.get::<_, i64>(0),
+    )
+    .unwrap_or(0)
+}
