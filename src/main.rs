@@ -1,4 +1,5 @@
 mod agent;
+mod agent_loop;
 mod config;
 mod dispatcher;
 mod events;
@@ -373,6 +374,34 @@ fn main() -> Result<()> {
         args.get(1).map(String::as_str),
         Some("status") | Some("hosts") | Some("cleanup") | Some("dispatch") | None
     );
+    // --- relay F2 ship-side heartbeat loop: fleetd agent --hub <url> ---
+    if args.get(1).map(String::as_str) == Some("agent") {
+        let hub = args
+            .iter()
+            .position(|a| a == "--hub")
+            .and_then(|i| args.get(i + 1))
+            .map(String::as_str);
+        let token = args
+            .iter()
+            .position(|a| a == "--token")
+            .and_then(|i| args.get(i + 1))
+            .map(String::as_str);
+        let seat = args
+            .iter()
+            .position(|a| a == "--seat")
+            .and_then(|i| args.get(i + 1))
+            .map(String::as_str);
+        let workdir = args
+            .iter()
+            .position(|a| a == "--workdir")
+            .and_then(|i| args.get(i + 1))
+            .map(String::as_str)
+            .unwrap_or(".")
+            .to_string();
+        let cfg = agent_loop::load_or_init(hub, token, seat)?;
+        agent_loop::run_loop(cfg, &workdir, "bypassPermissions")?;
+        return Ok(());
+    }
     let cfg = if needs_hosts {
         Some(FleetConfig::load(cfg_path)?)
     } else {
