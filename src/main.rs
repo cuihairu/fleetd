@@ -529,6 +529,10 @@ fn main() -> Result<()> {
                         std::thread::sleep(std::time::Duration::from_secs(2));
                     }
                     ledger::record_dispatch(&c, name, task, None)?;
+                    // composer submit: the paste lands as text; Enter commits it
+                    let _ = std::process::Command::new("tmux")
+                        .args(["send-keys", "-t", name, "Enter"])
+                        .output()?;
                     println!("{name} | {}", if delivered { "DELIVERED" } else { "PASTED (verify fold)" });
                 }
                 _ => println!("usage: fleetd seat stop|disable|enable|fire|list|gate-check [name]"),
