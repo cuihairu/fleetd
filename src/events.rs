@@ -58,7 +58,7 @@ pub fn ingest_and_dispatch(raw: &str, auto: bool) -> Result<(String, String)> {
 }
 
 /// Minimal HTTP/1.1 handler — no framework. Reads one request, answers JSON.
-pub fn handle_stream(stream: &mut TcpStream) -> Result<()> {
+pub fn handle_stream(stream: &mut TcpStream, relay_token: Option<&str>) -> Result<()> {
     let mut buf = Vec::with_capacity(8192);
     let mut tmp = [0u8; 4096];
     let header_end;
@@ -97,21 +97,52 @@ pub fn handle_stream(stream: &mut TcpStream) -> Result<()> {
     let body = String::from_utf8_lossy(&buf[body_start..(body_start + content_len).min(buf.len())])
         .to_string();
 
+    // Relay-face auth (relay-design F5): when a token is configured, the
+    // fleet/summary GET and the heartbeat POST require it; /v1/events stays
+    // open for the loopback hook path (hooks run on the hub itself).
+    let token_ok = relay_token.is_none()
+        || request_line.contains("/v1/events")
+        || head
+            .lines()
+            .any(|l| {
+                l.to_ascii_lowercase().starts_with("authorization:")
+                    && l.contains(relay_token.unwrap_or(""))
+            });
+
     let (status, payload) = match request_line.split_whitespace().next() {
         Some("POST") if request_line.contains("/v1/events") => match ingest(&body) {
             Ok(v) => (200, format!(r#"{{"verdict":"{}"}}"#, v)),
             Err(e) => (400, format!(r#"{{"error":"{}"}}"#, e)),
         },
+        // Agent heartbeat (relay F2): ships behind NAT/unstable networks
+        // POST {seat, head, dirty} on an outbound timer; the response
+        // carries pending pull-dispatches. Auth: relay token (F5).
+        Some("POST") if request_line.contains("/v1/agent/heartbeat") => {
+            if !token_ok {
+                (403, r#"{"error":"forbidden"}"#.to_string())
+            } else {
+                match crate::relay::heartbeat(&body) {
+                    Ok(reply) => match serde_json::to_string(&reply) {
+                        Ok(j) => (200, j),
+                        Err(e) => (500, format!(r#"{{"error":"{}"}}"#, e)),
+                    },
+                    Err(e) => (400, format!(r#"{{"error":"{}"}}"#, e)),
+                }
+            }
+        }
         // Read-only fleet summary for remote dashboards (2026-11-27).
-        // No auth in step 1: bind is loopback by default; token lands with
-        // the public relay face (relay-design F5).
+        // Loopback by default; token required when the relay face is on.
         Some("GET") if request_line.contains("/v1/fleet/summary") => {
-            match crate::summary::build(7) {
-                Ok(s) => match serde_json::to_string(&s) {
-                    Ok(j) => (200, j),
+            if !token_ok {
+                (403, r#"{"error":"forbidden"}"#.to_string())
+            } else {
+                match crate::summary::build(7) {
+                    Ok(s) => match serde_json::to_string(&s) {
+                        Ok(j) => (200, j),
+                        Err(e) => (500, format!(r#"{{"error":"{}"}}"#, e)),
+                    },
                     Err(e) => (500, format!(r#"{{"error":"{}"}}"#, e)),
-                },
-                Err(e) => (500, format!(r#"{{"error":"{}"}}"#, e)),
+                }
             }
         }
         _ => (404, r#"{"error":"not found"}"#.to_string()),
@@ -133,13 +164,19 @@ fn find_double_crlf(buf: &[u8]) -> Option<usize> {
 /// for the loopback-only default, or "0.0.0.0" when agents reach the hub
 /// over the network (fleetd agent pull mode / dev public relay).
 pub fn serve_on(bind_addr: &str, port: u16) -> Result<()> {
+    let relay_token = std::env::var("FLEETD_RELAY_TOKEN").ok().filter(|t| !t.is_empty());
+    if relay_token.is_some() && bind_addr != "127.0.0.1" {
+        eprintln!(
+            "fleetd relay face: http://{bind_addr}:{port}/v1/agent/heartbeat + /v1/fleet/summary (token required)"
+        );
+    }
     let listener =
         TcpListener::bind((bind_addr, port)).with_context(|| format!("bind {bind_addr}:{port}"))?;
     eprintln!("fleetd event endpoint: http://{bind_addr}:{port}/v1/events");
     for stream in listener.incoming() {
         match stream {
             Ok(mut s) => {
-                if let Err(e) = handle_stream(&mut s) {
+                if let Err(e) = handle_stream(&mut s, relay_token.as_deref()) {
                     eprintln!("event handling error: {e:#}");
                 }
             }

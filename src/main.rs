@@ -10,6 +10,7 @@ mod ledger;
 mod jobs;
 mod mcp_server;
 mod probe;
+mod relay;
 mod resources;
 mod summary;
 mod tools;
@@ -683,6 +684,24 @@ fn main() -> Result<()> {
                 );
             } else {
                 dispatch(cfg.as_ref().context("config required")?, task_file, repo)?;
+            }
+        }
+        // --- relay F2: queue pull-dispatch + agent liveness ---
+        Some("relay") => {
+            match args.get(2).map(String::as_str) {
+                Some("queue") => {
+                    let seat = args.get(3).context("usage: fleetd relay queue <seat> <task.md> <repo>")?;
+                    let task_file = args.get(4).context("usage: fleetd relay queue <seat> <task.md> <repo>")?;
+                    let repo = args.get(5).context("usage: fleetd relay queue <seat> <task.md> <repo>")?;
+                    let id = crate::relay::queue_pull(seat, task_file, repo)?;
+                    println!("queued pull id={id} seat={seat} (delivered on next heartbeat)");
+                }
+                Some("alive") => {
+                    for (seat, ts) in crate::relay::alive_since(15)? {
+                        println!("{seat} last-heartbeat {ts}s-epoch");
+                    }
+                }
+                _ => println!("usage: fleetd relay queue <seat> <task.md> <repo> | relay alive"),
             }
         }
         // --- self service registration (per-OS native mechanism) ---
