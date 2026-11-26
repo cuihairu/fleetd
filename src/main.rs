@@ -757,6 +757,48 @@ fn main() -> Result<()> {
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|_| "fleetd".into());
             match args.get(2).map(String::as_str) {
+                Some("start") | Some("stop") => {
+                    let verb = args.get(2).map(String::as_str).unwrap();
+                    match service::detect() {
+                        service::Platform::Windows => {
+                            let r = Command::new("cmd")
+                                .args(["/c", &format!("sc {} FleetD", verb)])
+                                .output()?;
+                            println!("windows: sc {} FleetD → {}", verb, r.status.success());
+                        }
+                        service::Platform::Linux => {
+                            let r = Command::new("systemctl")
+                                .args(["--user", verb, "fleetd"])
+                                .output()?;
+                            println!("linux: systemctl --user {} → {}", verb, r.status.success());
+                        }
+                        service::Platform::Macos => {
+                            let verb_launch = if verb == "start" { "load" } else { "unload" };
+                            let plist = format!(
+                                "{}/Library/LaunchAgents/ai.fleetd.plist",
+                                std::env::var("HOME").unwrap_or_default()
+                            );
+                            let r = Command::new("launchctl").args([verb_launch, &plist]).output()?;
+                            println!("macos: launchctl {} → {}", verb_launch, r.status.success());
+                        }
+                    }
+                }
+                Some("status") => {
+                    match service::detect() {
+                        service::Platform::Windows => {
+                            let r = Command::new("cmd")
+                                .args(["/c", "sc query FleetD"])
+                                .output()?;
+                            print!("{}", String::from_utf8_lossy(&r.stdout));
+                        }
+                        _ => {
+                            let r = Command::new("systemctl")
+                                .args(["--user", "status", "fleetd"])
+                                .output()?;
+                            print!("{}", String::from_utf8_lossy(&r.stdout));
+                        }
+                    }
+                }
                 Some("install") | Some("uninstall") => {
                     let uninstall = args.get(2).map(String::as_str) == Some("uninstall");
                     match service::detect() {
@@ -786,22 +828,20 @@ fn main() -> Result<()> {
                             }
                         }
                         service::Platform::Windows => {
-                            let tn = if uninstall { "/Delete" } else { "/Create" };
-                            for task in ["FleetD", "FleetDTray"] {
-                                if uninstall {
-                                    let _ = Command::new("schtasks")
-                                        .args(["/Delete", "/TN", task, "/F"])
-                                        .output();
-                                } else {
-                                    for c in service::windows_commands(&exe) {
-                                        if c.contains(task) {
-                                            let _ = Command::new("cmd").args(["/c", &c]).output();
-                                        }
-                                    }
+                            // Real SCM service + a separate tray ONLOGON task.
+                            if uninstall {
+                                let _ = Command::new("cmd").args(["/c", "sc stop FleetD"]).output();
+                                let _ = Command::new("cmd").args(["/c", "sc delete FleetD"]).output();
+                                let _ = Command::new("schtasks")
+                                    .args(["/Delete", "/TN", "FleetDTray", "/F"])
+                                    .output();
+                                println!("windows: service deleted");
+                            } else {
+                                for c in service::windows_commands(&exe) {
+                                    let _ = Command::new("cmd").args(["/c", &c]).output();
                                 }
+                                println!("windows: SCM service created+started, tray ONLOGON task registered");
                             }
-                            let _ = tn;
-                            println!("windows: tasks {} done", if uninstall { "deleted" } else { "created" });
                         }
                         service::Platform::Macos => {
                             let plist = format!(
@@ -824,7 +864,7 @@ fn main() -> Result<()> {
                     }
                 }
                 _ => {
-                    println!("usage: fleetd service install | service uninstall");
+                    println!("usage: fleetd service install|uninstall|start|stop|status");
                 }
             }
         }

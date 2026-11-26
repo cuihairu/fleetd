@@ -73,18 +73,24 @@ pub fn launchd_plist(exe: &str) -> String {
     )
 }
 
-/// Windows: one ONSTART task running the detached serve. The tray face is a
-/// separate ONLOGON task so the logged-in user still sees the wood gear.
+/// Windows: serve registers as a REAL SCM service (`sc create`, auto-start,
+/// restart-on-failure) — manageable from services.msc. The tray is a separate
+/// ONLOGON task launching `fleetd tray` in the interactive session
+/// (2026-11-27 用户令「serve 应该以服务的方式运行」).
 pub fn windows_commands(exe: &str) -> Vec<String> {
     vec![
         format!(
-            r#"schtasks /Create /F /SC ONSTART /TN FleetD /RL HIGHEST /TR "\"{exe}\" serve""#,
+            r#"sc create FleetD binPath= "\"{exe}\" serve" start= auto DisplayName= "fleetd flagship service""#,
             exe = exe
         ),
         format!(
-            r#"schtasks /Create /F /SC ONLOGON /TN FleetDTray /RL HIGHEST /TR "\"{exe}\" serve""#,
+            r#"sc failure FleetD reset= 86400 actions= restart/5000"#
+        ),
+        format!(
+            r#"schtasks /Create /F /SC ONLOGON /TN FleetDTray /RL HIGHEST /TR "\"{exe}\" tray""#,
             exe = exe
         ),
+        "sc start FleetD".to_string(),
     ]
 }
 
@@ -109,14 +115,15 @@ mod tests {
     }
 
     #[test]
-    fn windows_has_boot_and_logon_tasks() {
+    fn windows_registers_real_scm_service_plus_tray_task() {
         let cmds = windows_commands(r"C:\Users\cui\.fleetd\fleetd.exe");
-        assert_eq!(cmds.len(), 2);
-        assert!(cmds[0].contains("/SC ONSTART"));
-        // serve is a pure service — no tray flags anywhere (tray is its own
-        // `fleetd tray` ONLOGON process).
-        assert!(!cmds[0].contains("--no-tray"));
-        assert!(cmds[0].contains(" serve"));
-        assert!(cmds[1].contains("/SC ONLOGON")); // tray face for the session
+        assert_eq!(cmds.len(), 4); // create, failure-recovery, tray task, start
+        assert!(cmds[0].contains("sc create FleetD"));
+        assert!(cmds[0].contains("start= auto"));
+        assert!(cmds[0].contains(" serve")); // pure service, no tray flags
+        assert!(cmds[1].contains("sc failure FleetD")); // auto-restart
+        assert!(cmds[2].contains("/SC ONLOGON")); // tray face
+        assert!(cmds[2].contains(" tray")); // tray is its own process
+        assert_eq!(cmds[3], "sc start FleetD");
     }
 }
