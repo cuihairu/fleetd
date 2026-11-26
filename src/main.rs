@@ -230,9 +230,26 @@ fn cleanup_local(scratch: &str, hours: u64) -> Result<()> {
 
 /// Dispatch one task file to the least-loaded host, record in ledger.
 fn dispatch(cfg: &FleetConfig, task_file: &str, repo: &str) -> Result<()> {
+    // Gate check: a disabled seat must never receive dispatches (2026-11-26
+    // falcon incident). The gate lives in the ledger keyed by seat name;
+    // host name and seat name are the same identifier in this deployment.
+    let gate = ledger::open()?;
+    let gated: Vec<String> = cfg
+        .hosts
+        .iter()
+        .filter(|h| ledger::is_disabled(&gate, &h.name).unwrap_or(false))
+        .map(|h| h.name.clone())
+        .collect();
+    if !gated.is_empty() {
+        println!("DISPATCH gate: skipping disabled seats: {}", gated.join(", "));
+    }
     let mut running = Vec::new();
     for h in &cfg.hosts {
         // skip unreachable hosts entirely; they never get picked
+        // skip gated (disabled) seats too — absolute, not advisory
+        if gated.iter().any(|g| g == &h.name) {
+            continue;
+        }
         if let Ok(n) = count_claude(h) {
             running.push((h.name.clone(), n));
         }
