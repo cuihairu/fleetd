@@ -167,15 +167,25 @@ pub fn run_command(command: &str) -> Result<(i32, String)> {
     };
 
     if command.trim_end().ends_with(".py") {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
         {
+            // CLI `job run` bypasses serve(), so the interpreter may not be
+            // booted in this process yet; init is idempotent (OnceLock).
+            struct NoopApi;
+            impl crate::pyhost::FleetdApi for NoopApi {
+                fn log(&self, _m: &str) {}
+                fn alert(&self, _m: &str) {}
+                fn seats(&self) -> Vec<(String, String)> { Vec::new() }
+                fn jobs(&self) -> Vec<(String, String, bool)> { Vec::new() }
+                fn run_job(&self, _name: &str) -> anyhow::Result<i32> { Ok(0) }
+            }
+            let _ = crate::pyhost::init(Box::new(NoopApi));
             let source = std::fs::read_to_string(command)
                 .with_context(|| format!("read python job {command}"))?;
-            let code = match crate::pyhost::run_source(&source) {
+            match crate::pyhost::run_source(&source) {
                 Ok(stdout) => return finish(0, &stdout),
                 Err(e) => return finish(1, &format!("{e:#}")),
-            };
-            let _ = code;
+            }
         }
         #[cfg(target_os = "windows")]
         {
