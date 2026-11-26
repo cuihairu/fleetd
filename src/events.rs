@@ -99,7 +99,7 @@ pub fn handle_stream(stream: &mut TcpStream, relay_token: Option<&str>) -> Resul
 
     // Relay-face auth (relay-design F5): when a token is configured, the
     // fleet/summary GET and the heartbeat POST require it; /v1/events stays
-    // open for the loopback hook path (hooks run on the hub itself).
+    // open for the loopback hook path (hooks run on the flagship itself).
     let token_ok = relay_token.is_none()
         || request_line.contains("/v1/events")
         || head
@@ -161,7 +161,7 @@ fn find_double_crlf(buf: &[u8]) -> Option<usize> {
 }
 
 /// Serve events forever on `bind_addr`. Blocks the caller. Pass "127.0.0.1"
-/// for the loopback-only default, or "0.0.0.0" when agents reach the hub
+/// for the loopback-only default, or "0.0.0.0" when agents reach the flagship
 /// over the network (fleetd agent pull mode / dev public relay).
 pub fn serve_on(bind_addr: &str, port: u16) -> Result<()> {
     let relay_token = std::env::var("FLEETD_RELAY_TOKEN").ok().filter(|t| !t.is_empty());

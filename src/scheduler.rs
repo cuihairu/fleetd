@@ -158,7 +158,7 @@ pub fn ts(v: i64) -> DateTime<Local> {
 
 /// Run one shell command, capture tail, return (exit_code, output_tail).
 /// Commands ending in `.py` run through Python: the embedded interpreter on
-/// the Linux hub (full CPython via PyO3), the system Python on Windows seats
+/// the Linux flagship (full CPython via PyO3), the system Python on Windows seats
 /// (no libpython there — same `fleetd` hook module, different source).
 pub fn run_command(command: &str) -> Result<(i32, String)> {
     let finish = |code: i32, text: &str| -> Result<(i32, String)> {

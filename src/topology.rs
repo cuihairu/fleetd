@@ -2,17 +2,17 @@
 //!
 //! Architecture (user order 2026-11-26): every machine runs one fleetd as a
 //! "ship" — it owns that machine's hook ingestion, resource probes, job
-//! scheduler and its own ledger. A hub machine additionally runs the
+//! scheduler and its own ledger. A flagship machine additionally runs the
 //! "fleet" aggregation: it pulls each ship's facts and gives a whole-fleet
 //! view plus cross-ship dispatch decisions.
 //!
 //! Config: `~/.fleetd/fleet.toml`
 //! ```toml
 //! [ship]
-//! name = "hub"              # this ship's name (events are tagged with it)
+//! name = "flagship"              # this ship's name (events are tagged with it)
 //!
-//! [fleet]                   # optional: only the hub has this section
-//! hub = true
+//! [fleet]                   # optional: only the flagship has this section
+//! flagship = true
 //! ships = [                 # ships to aggregate (excluding self)
 //!   { name = "work-runner", ssh = "work-runner" },
 //!   { name = "openclaw",    ssh = "openclaw" },
@@ -40,9 +40,9 @@ pub struct FleetShip {
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct FleetCfg {
-    /// This ship aggregates the fleet (hub role).
+    /// This ship aggregates the fleet (flagship role).
     #[serde(default)]
-    pub hub: bool,
+    pub flagship: bool,
     /// Other ships to aggregate.
     #[serde(default)]
     pub ships: Vec<FleetShip>,
@@ -85,9 +85,9 @@ impl Topology {
             .join("fleet.toml")
     }
 
-    /// Is this ship the fleet hub (aggregation role)?
-    pub fn is_hub(&self) -> bool {
-        self.fleet.hub
+    /// Is this ship the fleet flagship (aggregation role)?
+    pub fn is_flagship(&self) -> bool {
+        self.fleet.flagship
     }
 }
 
@@ -98,15 +98,15 @@ pub fn hostname() -> String {
         .unwrap_or_else(|_| "unknown".into())
 }
 
-/// Pull a remote ship's ledger into the hub's aggregation area.
+/// Pull a remote ship's ledger into the flagship's aggregation area.
 /// Uses scp over the ship's ssh alias; returns the local copy path.
 pub fn pull_ship_ledger(ssh: &str, ship_name: &str) -> Result<PathBuf> {
-    let hub_dir = dirs::home_dir()
+    let flagship_dir = dirs::home_dir()
         .expect("home dir")
         .join(".fleetd")
         .join("ships");
-    fs::create_dir_all(&hub_dir)?;
-    let local = hub_dir.join(format!("{ship_name}.db"));
+    fs::create_dir_all(&flagship_dir)?;
+    let local = flagship_dir.join(format!("{ship_name}.db"));
     let remote_path = "~/.fleetd/ledger.db";
     let status: Result<()> = if ssh == "local" {
         let home = crate::ledger::home_dir();

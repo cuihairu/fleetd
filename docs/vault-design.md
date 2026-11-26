@@ -41,8 +41,8 @@ fleetd **不自建密钥库**，做 persona 的 fleet 分发适配层。
 
 ## 实现顺序
 
-1. F2 心跳通道（ship 出站到 hub）——vault 分发的载体
-2. vault 分发：`fleetd tools config sync`（hub 拉 persona → 封装下发）
+1. F2 心跳通道（ship 出站到 flagship）——vault 分发的载体
+2. vault 分发：`fleetd tools config sync`（flagship 拉 persona → 封装下发）
 3. 额度查询：`fleetd quota`（persona 条目里的 provider 用量端点聚合）
 4. gateway-fleet 纳管：`fleetd status` 加 litellm/gateway 服务健康行
 
@@ -50,5 +50,5 @@ fleetd **不自建密钥库**，做 persona 的 fleet 分发适配层。
 
 - 分发默认关：显式 `fleetd tools config sync --scope <ship>` 才下发
 - payload 端到端加密（ship 公钥封装），中继/公网零明文
-- hub 不落任何明文密钥到磁盘（persona 是唯一权威源）
-- 审计：hub 记录谁在何时拉了哪个条目
+- flagship 不落任何明文密钥到磁盘（persona 是唯一权威源）
+- 审计：flagship 记录谁在何时拉了哪个条目

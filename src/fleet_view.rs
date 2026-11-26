@@ -1,8 +1,8 @@
-// `fleetd fleet <hub-url>` — remote fleet overview on any machine (ANSI
-// table, user-approved option A over a full TUI framework). Pulls the hub's
+// `fleetd fleet <flagship-url>` — remote fleet overview on any machine (ANSI
+// table, user-approved option A over a full TUI framework). Pulls the flagship's
 // /v1/fleet/summary and renders a compact seat/task table. `--follow` polls.
 //
-// Data contract: GET {hub}/v1/fleet/summary -> {"seats":[{seat,status,
+// Data contract: GET {flagship}/v1/fleet/summary -> {"seats":[{seat,status,
 // current_tag,updated_at}],"recent_dispatches":[{id,seat,tag,fired_at,
 // finished_at,outcome}],"open_count":N}
 
@@ -119,12 +119,12 @@ fn fmt_age(secs: i64) -> String {
 }
 
 /// One-shot render, or follow loop (`--follow` clears and redraws every 2s).
-pub fn run(hub: &str, follow: bool) -> Result<(), String> {
-    let url = format!("{}/v1/fleet/summary", hub.trim_end_matches('/'));
+pub fn run(flagship: &str, follow: bool) -> Result<(), String> {
+    let url = format!("{}/v1/fleet/summary", flagship.trim_end_matches('/'));
     loop {
         let rendered = match http_get(&url) {
             Ok(j) => render(&j, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64)?,
-            Err(e) => format!("{RED}hub unreachable: {e}{RESET}"),
+            Err(e) => format!("{RED}flagship unreachable: {e}{RESET}"),
         };
         if follow {
             // Clear screen + home cursor (ANSI; works in every fleet terminal).

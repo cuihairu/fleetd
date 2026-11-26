@@ -1,6 +1,6 @@
 # What fleetd should adopt from Orca (stablyai/orca)
 
-Source: https://github.com/stablyai/orca — 139k stars, MIT, Electron + pnpm
+Source: https://gitflagship.com/stablyai/orca — 139k stars, MIT, Electron + pnpm
 monorepo. Researched 2026-11-26 against fleetd's actual situation
 (multi-machine headless fleet, WeChat control plane, ZeroTier network).
 
@@ -61,16 +61,16 @@ Transient inputs (`createdWithAgent`, `promisedAgentChat`) are NOT persisted
 as workspace metadata; old clients talking to a new host still get correct
 behavior. "No client-local SSH fallback" — one owner of the decision.
 
-fleetd gap: behavior is split between scripts on each seat and the hub;
+fleetd gap: behavior is split between scripts on each seat and the flagship;
 old/new script versions cause divergent verdicts (the "双口径" problem in
 the user's rules).
 
 Adopt:
-- Put dispatch decisions in the hub daemon only; seats report observations,
+- Put dispatch decisions in the flagship daemon only; seats report observations,
   never decide their own state.
 - Accept additive optional fields on events/notes from older agents;
   never require a synchronized upgrade of all seats.
-- One source of truth (`ledger.db` on hub), no per-seat "I think I'm done".
+- One source of truth (`ledger.db` on flagship), no per-seat "I think I'm done".
 
 ## Pattern 4: Managed skill bundles (capability distribution)
 
@@ -83,7 +83,7 @@ fleetd gap: the user asked "是写技能还是怎么办 / 需要告诉 claude �
 on each machine), no distribution/versioning.
 
 Adopt (small scale):
-- fleetd holds a canonical skill registry (git repo or directory on hub).
+- fleetd holds a canonical skill registry (git repo or directory on flagship).
 - `fleetd skills sync <seat>` pushes/validates skill checksums to that seat.
 - No need for signed GCS bundles; a checksum + source path is enough for the
   user's trust level. Keep data-out defaults off (user's hard rule).
@@ -95,7 +95,7 @@ Orca's AGENTS.md lists "Remote hosts — features should work locally and on
 remote hosts" as a first-class citizen. fleetd is already agent-side and
 headless, so this is a natural advantage — keep it, don't regress.
 
-Concretely: every new fleetd command must work when invoked from the hub
+Concretely: every new fleetd command must work when invoked from the flagship
 against any seat (local or remote), not only on the machine where it runs.
 
 ## Pattern 6: Engineering discipline (ratchets, changed-only gates)

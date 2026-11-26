@@ -1,10 +1,10 @@
 // `fleetd agent` — ship-side heartbeat loop (relay F2 client face).
 //
 // Ships behind NAT/unstable networks run this loop instead of relying on
-// hub→ship inbound SSH. Every cycle:
-//   1. POST heartbeat {seat, head, dirty} to the hub (outbound only)
+// flagship→ship inbound SSH. Every cycle:
+//   1. POST heartbeat {seat, head, dirty} to the flagship (outbound only)
 //   2. if the response carries a pull-dispatch → write task file, launch
-//      headless claude, and keep heartbeating (state lands on the hub via
+//      headless claude, and keep heartbeating (state lands on the flagship via
 //      the next beat's head/dirty fields; the run artifacts stay on disk)
 //   3. sleep and repeat; failures never kill the loop
 //
@@ -23,7 +23,8 @@ const AGENT_CONF: &str = ".fleetd/agent.toml";
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct AgentConfig {
-    pub hub: String,
+    #[serde(alias = "hub")]
+    pub flagship: String,
     pub token: String,
     pub seat: String,
     #[serde(default = "default_interval")]
@@ -34,27 +35,27 @@ fn default_interval() -> u64 {
     30
 }
 
-pub fn load_or_init(hub: Option<&str>, token: Option<&str>, seat: Option<&str>) -> Result<AgentConfig> {
+pub fn load_or_init(flagship: Option<&str>, token: Option<&str>, seat: Option<&str>) -> Result<AgentConfig> {
     let home = crate::ledger::home_dir();
     let conf_path = std::path::Path::new(&home).join(AGENT_CONF);
-    load_from(&conf_path, hub, token, seat)
+    load_from(&conf_path, flagship, token, seat)
 }
 
 /// Conf-path injected variant (tests use a tempdir; keeps HOME untouched).
 pub fn load_from(
     conf_path: &std::path::Path,
-    hub: Option<&str>,
+    flagship: Option<&str>,
     token: Option<&str>,
     seat: Option<&str>,
 ) -> Result<AgentConfig> {
+    let flagship_field: Option<String> = flagship.map(String::from);
     let saved: Option<AgentConfig> = std::fs::read_to_string(conf_path)
         .ok()
         .and_then(|s| toml::from_str(&s).ok());
     let cfg = AgentConfig {
-        hub: hub
-            .map(String::from)
-            .or_else(|| saved.as_ref().map(|c| c.hub.clone()))
-            .context("hub url required (first run): fleetd agent --hub http://host:3790")?,
+        flagship: flagship_field
+            .or_else(|| saved.as_ref().map(|c| c.flagship.clone()))
+            .context("flagship url required (first run): fleetd agent --flagship http://host:3790")?,
         token: token
             .map(String::from)
             .or_else(|| saved.as_ref().map(|c| c.token.clone()))
@@ -79,8 +80,8 @@ pub fn load_from(
         std::fs::write(
             conf_path,
             format!(
-                "hub = \"{}\"\ntoken = \"{}\"\nseat = \"{}\"\n",
-                cfg.hub, cfg.token, cfg.seat
+                "flagship = \"{}\"\ntoken = \"{}\"\nseat = \"{}\"\n",
+                cfg.flagship, cfg.token, cfg.seat
             ),
         )
         .ok();
@@ -126,7 +127,7 @@ fn beat(cfg: &AgentConfig, workdir: &str) -> Option<(String, String, String)> {
             "15",
             "-X",
             "POST",
-            &format!("{}/v1/agent/heartbeat", cfg.hub.trim_end_matches('/')),
+            &format!("{}/v1/agent/heartbeat", cfg.flagship.trim_end_matches('/')),
             "-H",
             &format!("Authorization: Bearer {}", cfg.token),
             "-H",
@@ -151,8 +152,8 @@ pub fn run_loop(cfg: AgentConfig, workdir: &str, permission_mode: &str) -> Resul
     let runs_dir = std::path::Path::new(&home).join(".fleetd/agent-runs");
     std::fs::create_dir_all(&runs_dir).ok();
     println!(
-        "fleetd agent: seat={} hub={} interval={}s workdir={}",
-        cfg.seat, cfg.hub, cfg.interval_secs, workdir
+        "fleetd agent: seat={} flagship={} interval={}s workdir={}",
+        cfg.seat, cfg.flagship, cfg.interval_secs, workdir
     );
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
@@ -162,7 +163,7 @@ pub fn run_loop(cfg: AgentConfig, workdir: &str, permission_mode: &str) -> Resul
                 let _ = writeln!(lock, "[{}] dispatch {}: {} chars", now(), id, task_text.len());
                 let _ = lock.flush();
                 // Materialize the task and launch headless claude (fire and
-                // forget with setsid; the hub sees progress via git head on
+                // forget with setsid; the flagship sees progress via git head on
                 // later beats).
                 let dir = runs_dir.join(&id);
                 let _ = std::fs::create_dir_all(&dir);
@@ -211,12 +212,12 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("fleetd-agent-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let conf = dir.join(".fleetd/agent.toml");
-        let cfg = load_from(&conf, Some("http://hub:3790"), Some("tok"), Some("ship-a")).unwrap();
+        let cfg = load_from(&conf, Some("http://flagship:3790"), Some("tok"), Some("ship-a")).unwrap();
         assert_eq!(cfg.seat, "ship-a");
         let saved = std::fs::read_to_string(&conf).unwrap();
-        assert!(saved.contains("http://hub:3790"));
+        assert!(saved.contains("http://flagship:3790"));
         // Second load without flags reads the persisted config.
         let again = load_from(&conf, None, None, None).unwrap();
-        assert_eq!(again.hub, "http://hub:3790");
+        assert_eq!(again.flagship, "http://flagship:3790");
     }
 }

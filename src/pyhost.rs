@@ -1,8 +1,8 @@
 //! Embedded Python host for fleetd — PyO3 binding to real CPython.
 //!
-//! Full Python (3.14 on the hub), not a subset: the user explicitly rejected
+//! Full Python (3.14 on the flagship), not a subset: the user explicitly rejected
 //! an embedded partial implementation (RustPython). Compiled only where a
-//! libpython is available (linux hub); Windows seats run `.py` jobs through
+//! libpython is available (linux flagship); Windows seats run `.py` jobs through
 //! the system Python instead (see scheduler::run_command). The `fleetd`
 //! module surface is identical on both paths, so scripts are portable.
 //!
@@ -18,7 +18,7 @@
 //! process. Registration injects the module into `sys` and `builtins` so a
 //! bare `import fleetd` resolves.
 
-// Compiled on every fleetd target: linux hub links the system libpython,
+// Compiled on every fleetd target: linux flagship links the system libpython,
 // windows seats link python3.dll (abi3) and expect the bundled `runtime/`
 // directory next to the exe (python3.dll + python315.dll + DLLs/ + Lib/).
 // Three-tier fallback at init: bundled runtime -> system python3.dll ->

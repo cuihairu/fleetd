@@ -44,7 +44,7 @@ pub fn serve_args(tray: bool) -> &'static str {
 
 pub fn systemd_unit(exe: &str) -> String {
     format!(
-        "[Unit]\nDescription=fleetd hub/ship agent\nAfter=network-online.target\n\n\
+        "[Unit]\nDescription=fleetd flagship/ship agent\nAfter=network-online.target\n\n\
 [Service]\nType=simple\nExecStart={exe} serve --no-tray\nRestart=on-failure\nRestartSec=5\n\n\
 [Install]\nWantedBy=default.target\n"
     )

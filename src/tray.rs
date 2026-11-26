@@ -72,7 +72,7 @@ const MENU_OPEN_PANEL: usize = 101;
 const MENU_QUIT: usize = 102;
 
 /// Status text shown as the disabled first row of the menu, e.g.
-/// "fleetd 0.1.0 — hub :3790". Written by serve before the menu opens.
+/// "fleetd 0.1.0 — flagship :3790". Written by serve before the menu opens.
 static G_STATUS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 pub fn set_status(line: String) {
@@ -91,6 +91,8 @@ unsafe fn build_menu() -> HMENU {
     if menu.is_null() {
         return std::ptr::null_mut();
     }
+    // Admiral framing (2026-11-27 用户令): the human running this fleet is the
+    // admiral; the menu speaks to them in fleet vocabulary.
     let status = G_STATUS
         .lock()
         .ok()

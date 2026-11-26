@@ -21,7 +21,7 @@ mod topology;
 #[cfg(target_os = "windows")]
 mod tray;
 
-// Embedded CPython (PyO3): linux hub links system libpython; windows seats
+// Embedded CPython (PyO3): linux flagship links system libpython; windows seats
 // link python3.dll (abi3) and use the bundled runtime/ directory. See pyhost.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 mod pyhost;
@@ -374,11 +374,13 @@ fn main() -> Result<()> {
         args.get(1).map(String::as_str),
         Some("status") | Some("hosts") | Some("cleanup") | Some("dispatch") | None
     );
-    // --- relay F2 ship-side heartbeat loop: fleetd agent --hub <url> ---
+    // --- relay F2 ship-side heartbeat loop: fleetd agent --flagship <url> ---
     if args.get(1).map(String::as_str) == Some("agent") {
-        let hub = args
+        // --hub is a legacy alias for --flagship (rename 2026-11-27; old
+        // scripts and muscle memory keep working).
+        let flagship = args
             .iter()
-            .position(|a| a == "--hub")
+            .position(|a| a == "--flagship" || a == "--hub")
             .and_then(|i| args.get(i + 1))
             .map(String::as_str);
         let token = args
@@ -398,7 +400,7 @@ fn main() -> Result<()> {
             .map(String::as_str)
             .unwrap_or(".")
             .to_string();
-        let cfg = agent_loop::load_or_init(hub, token, seat)?;
+        let cfg = agent_loop::load_or_init(flagship, token, seat)?;
         agent_loop::run_loop(cfg, &workdir, "bypassPermissions")?;
         return Ok(());
     }
@@ -437,21 +439,21 @@ fn main() -> Result<()> {
                 _ => println!("fleetd job: add <name> <schedule> <cmd> | list | run <name> | enable|disable <name> | remove <name> | stats [name]"),
             }
         }
-        // --- fleet aggregation (hub role): pull ship ledgers, whole-fleet view ---
+        // --- fleet aggregation (flagship role): pull ship ledgers, whole-fleet view ---
         Some("fleet") => {
             let t = topology::Topology::load()?;
             match args.get(2).map(String::as_str) {
-                // Remote overview: fleetd fleet overview <hub-url> [--follow]
+                // Remote overview: fleetd fleet overview <flagship-url> [--follow]
                 Some("overview") => {
-                    let hub = args
+                    let flagship = args
                         .get(3)
-                        .context("usage: fleetd fleet overview <hub-url> [--follow]")?
+                        .context("usage: fleetd fleet overview <flagship-url> [--follow]")?
                         .clone();
                     let follow = args.iter().any(|a| a == "--follow");
-                    fleet_view::run(&hub, follow).map_err(|e| anyhow::anyhow!(e))?;
+                    fleet_view::run(&flagship, follow).map_err(|e| anyhow::anyhow!(e))?;
                 }
                 Some("ships") => {
-                    println!("self ship = {}{}", t.ship.name, if t.is_hub() { " (HUB)" } else { "" });
+                    println!("self ship = {}{}", t.ship.name, if t.is_flagship() { " (FLAGSHIP)" } else { "" });
                     for s in &t.fleet.ships {
                         println!("  ship {} via ssh {}", s.name, s.ssh);
                     }
@@ -903,7 +905,7 @@ fn main() -> Result<()> {
             // port + mode, so the menu's first row is the live fact.
             #[cfg(target_os = "windows")]
             crate::tray::set_status(format!(
-                "fleetd {} — hub :{}",
+                "fleetd {} — flagship :{}",
                 env!("CARGO_PKG_VERSION"),
                 port
             ));

@@ -3,7 +3,7 @@
 状态：设计定稿（2026-11-27，用户批准方向）。日期：2026-11-27。
 背景：fleetd 的 `hosts` 概念目前绑死了 coding agent（`max_concurrent`
 = claude 并发数、`workdir` = repo checkout 根）。实际舰队里每台机器
-的能力不同：dev 是 hub+网关、work-runner 是纯执行机、imac/openclaw
+的能力不同：dev 是 flagship+网关、work-runner 是纯执行机、imac/openclaw
 是 Windows 桌面机（还有 Android 设备、GPU 机器这类非主机资源）。
 需要把「节点」抽象成能力声明式的 worker，派单按能力路由。
 
@@ -23,7 +23,7 @@ executors = [
   { kind = "opencode",  max_concurrent = 2 },
   { kind = "shell",     max_concurrent = 8 },   # 通用命令执行面
 ]
-tags = ["hub", "gateway", "linux"]
+tags = ["flagship", "gateway", "linux"]
 
 [[workers]]
 name = "imac"
@@ -52,7 +52,7 @@ trait Executor {
 - `shell` executor：通用命令执行（jobs 面已有，挂进同一抽象）。
 - `ahk-ui` executor：openclaw 的 ahk-mcp（UIA 自动化）——设备类任务。
 - 未来 worker 类型（编译农场、GPU 推理、浏览器 farm）= 新 Executor
-  实现 + 声明到对应节点的 executors 列表，hub 零改动。
+  实现 + 声明到对应节点的 executors 列表，flagship 零改动。
 
 ## 派单路由演进
 
@@ -89,6 +89,6 @@ fleetd dispatch --executor shell "cmd"          # 通用命令
 
 ## 明确不做
 
-- 不做通用调度器（K8s 替代品）——单 fleet 单 hub 的简单路由足够。
+- 不做通用调度器（K8s 替代品）——单 fleet 单 flagship 的简单路由足够。
 - 不做动态节点发现（mDNS 等）——节点列表显式声明。
 - 不做跨 fleet 联邦。

@@ -1,11 +1,11 @@
 //! Relay F2: agent-pull channel for ships behind NAT/unstable networks.
 //!
-//! Ships POST a heartbeat on an outbound timer; the hub records liveness in
+//! Ships POST a heartbeat on an outbound timer; the flagship records liveness in
 //! `agent_seen` and returns any pending pull-dispatch in the response body.
 //! This is the ONLY channel for machines like cuihaitao / home-pve that
 //! cannot hold inbound SSH (their network drops inbound; outbound works).
 //!
-//! Transport: plain HTTPS via the hub relay face (FLEETD_RELAY_TOKEN).
+//! Transport: plain HTTPS via the flagship relay face (FLEETD_RELAY_TOKEN).
 //! Payload today carries seat metadata only (no task text) — the vault
 //! distribution face (docs/vault-design.md) adds encrypted payloads later
 //! over this same channel.
@@ -114,7 +114,7 @@ fn pending_pull(c: &rusqlite::Connection, seat: &str) -> Result<Option<PullDispa
     Ok(None)
 }
 
-/// Queue a pull-dispatch for a ship (hub side: `fleetd relay dispatch`).
+/// Queue a pull-dispatch for a ship (flagship side: `fleetd relay dispatch`).
 pub fn queue_pull(seat: &str, task_file: &str, repo: &str) -> Result<i64> {
     let c = db()?;
     let now = std::time::SystemTime::now()
