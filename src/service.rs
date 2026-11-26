@@ -14,7 +14,6 @@
 //
 // Uninstall mirrors install (remove the definition + stop).
 
-use std::process::Command;
 
 pub enum Platform {
     Linux,
@@ -38,14 +37,14 @@ pub fn serve_args(tray: bool) -> &'static str {
     if tray {
         "serve"
     } else {
-        "serve --no-tray"
+        "serve"
     }
 }
 
 pub fn systemd_unit(exe: &str) -> String {
     format!(
         "[Unit]\nDescription=fleetd flagship/ship agent\nAfter=network-online.target\n\n\
-[Service]\nType=simple\nExecStart={exe} serve --no-tray\nRestart=on-failure\nRestartSec=5\n\n\
+[Service]\nType=simple\nExecStart={exe} serve\nRestart=on-failure\nRestartSec=5\n\n\
 [Install]\nWantedBy=default.target\n"
     )
 }
@@ -79,7 +78,7 @@ pub fn launchd_plist(exe: &str) -> String {
 pub fn windows_commands(exe: &str) -> Vec<String> {
     vec![
         format!(
-            r#"schtasks /Create /F /SC ONSTART /TN FleetD /RL HIGHEST /TR "\"{exe}\" serve --no-tray""#,
+            r#"schtasks /Create /F /SC ONSTART /TN FleetD /RL HIGHEST /TR "\"{exe}\" serve""#,
             exe = exe
         ),
         format!(
@@ -96,7 +95,7 @@ mod tests {
     #[test]
     fn systemd_unit_has_restart_and_enable_target() {
         let u = systemd_unit("/usr/local/bin/fleetd");
-        assert!(u.contains("ExecStart=/usr/local/bin/fleetd serve --no-tray"));
+        assert!(u.contains("ExecStart=/usr/local/bin/fleetd serve"));
         assert!(u.contains("Restart=on-failure"));
         assert!(u.contains("WantedBy=default.target"));
     }
@@ -114,7 +113,10 @@ mod tests {
         let cmds = windows_commands(r"C:\Users\cui\.fleetd\fleetd.exe");
         assert_eq!(cmds.len(), 2);
         assert!(cmds[0].contains("/SC ONSTART"));
-        assert!(cmds[0].contains("--no-tray"));
+        // serve is a pure service — no tray flags anywhere (tray is its own
+        // `fleetd tray` ONLOGON process).
+        assert!(!cmds[0].contains("--no-tray"));
+        assert!(cmds[0].contains(" serve"));
         assert!(cmds[1].contains("/SC ONLOGON")); // tray face for the session
     }
 }

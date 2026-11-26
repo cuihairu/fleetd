@@ -374,6 +374,22 @@ fn main() -> Result<()> {
         args.get(1).map(String::as_str),
         Some("status") | Some("hosts") | Some("cleanup") | Some("dispatch") | None
     );
+    // --- standalone tray process: fleetd tray (pulls /v1/status) ---
+    if args.get(1).map(String::as_str) == Some("tray") {
+        #[cfg(target_os = "windows")]
+        {
+            crate::tray::spawn();
+            return Ok(());
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            // macOS/Linux desktop faces are future work (NSStatusItem /
+            // AppIndicator over the status socket — docs/vocabulary.md).
+            // Headless platforms simply have no tray.
+            println!("fleetd tray: not implemented on this platform yet (windows only)");
+            return Ok(());
+        }
+    }
     // --- relay F2 ship-side heartbeat loop: fleetd agent --flagship <url> ---
     if args.get(1).map(String::as_str) == Some("agent") {
         // --hub is a legacy alias for --flagship (rename 2026-11-27; old
@@ -886,14 +902,10 @@ fn main() -> Result<()> {
             println!("{seat} -> {verdict}");
         }
         Some("serve") => {
-            // Windows: show the rotating wood gear in the tray so the person
-            // at the machine can see fleetd is running. --no-tray suppresses it.
-            #[cfg(target_os = "windows")]
-            let _tray = if args.iter().any(|a| a == "--no-tray") {
-                None
-            } else {
-                crate::tray::spawn()
-            };
+            // Tray is a SEPARATE process now (`fleetd tray`, 2026-11-27 用户令
+            // 「tray 和 serve 拆开」): serve never spawns it; the OS service
+            // face (FleetDTray ONLOGON / launchd agent) launches `fleetd tray`
+            // in the interactive session. Serve headless always.
             // fleetd serve [--port 3790] [--no-scheduler]
             let port = args
                 .iter()
@@ -901,14 +913,8 @@ fn main() -> Result<()> {
                 .and_then(|i| args.get(i + 1))
                 .and_then(|p| p.parse().ok())
                 .unwrap_or(3790u16);
-            // Tray status line (2026-11-27 用户令「右键能看状态」): version +
-            // port + mode, so the menu's first row is the live fact.
-            #[cfg(target_os = "windows")]
-            crate::tray::set_status(format!(
-                "fleetd {} — flagship :{}",
-                env!("CARGO_PKG_VERSION"),
-                port
-            ));
+            // Tray pulls its status over /v1/status (separate process) —
+            // serve has nothing to do with the tray face anymore.
             // background scheduler thread — same daemon, user-space, no root.
             if !args.iter().any(|a| a == "--no-scheduler") {
                 std::thread::spawn(|| {

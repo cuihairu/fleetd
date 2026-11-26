@@ -12,6 +12,8 @@
 //! platforms run fleetd headless. Any tray failure is silent — the daemon must
 //! never die because of the tray.
 
+// Windows-only desktop face. serve is a pure service on every platform;
+// macOS/Linux desktop indicators are future UDS-socket faces (not "tray").
 #![cfg(target_os = "windows")]
 
 use std::os::windows::process::CommandExt;
