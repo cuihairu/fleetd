@@ -9,6 +9,7 @@ pub struct Host {
     /// SSH target alias (e.g. "imac", "openclaw") or "local" for this host.
     pub ssh: String,
     /// Maximum concurrent claude tasks this host can run.
+    #[serde(default = "default_max_concurrent")]
     pub max_concurrent: usize,
     /// OS family for command selection: "linux" | "windows" | "macos".
     #[serde(default = "default_os")]
@@ -22,6 +23,10 @@ pub struct Host {
     /// Delete scratch entries older than this many hours (0 = never clean).
     #[serde(default)]
     pub cleanup_hours: u64,
+}
+
+fn default_max_concurrent() -> usize {
+    4
 }
 
 fn default_os() -> String {
@@ -54,7 +59,85 @@ impl Host {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct FleetConfig {
+    /// Legacy face: one host = one implicit claude executor. Kept for
+    /// backward compatibility; `workers` supersedes it (worker-design.md).
     pub hosts: Vec<Host>,
+    /// New face: capability-declared workers (2026-11-27 worker-design.md).
+    /// Empty = derive from `hosts` (each host becomes one worker with a
+    /// single claude executor), so old configs keep working unchanged.
+    #[serde(default)]
+    pub workers: Vec<Worker>,
+}
+
+/// One declared executor on a worker: a dispatchable capability with its
+/// own concurrency budget.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ExecutorCfg {
+    /// claude | codex | opencode | shell | ahk-ui | …
+    pub kind: String,
+    #[serde(default = "default_executor_concurrency")]
+    pub max_concurrent: usize,
+    #[serde(default)]
+    pub workdir: String,
+}
+
+fn default_executor_concurrency() -> usize {
+    1
+}
+
+/// A worker node: a machine (or logical execution site) with declared
+/// capabilities. `channel` routes dispatches: "local", "ssh:<alias>" or
+/// "agent" (relay F2 pull; lands with the heartbeat face).
+#[derive(Debug, Clone, Deserialize)]
+pub struct Worker {
+    pub name: String,
+    #[serde(default = "default_channel")]
+    pub channel: String,
+    pub executors: Vec<ExecutorCfg>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default = "default_os")]
+    pub os: String,
+}
+
+fn default_channel() -> String {
+    "local".to_string()
+}
+
+impl Worker {
+    /// Total concurrent capacity across executors (aggregation view).
+    pub fn max_concurrent(&self) -> usize {
+        self.executors.iter().map(|e| e.max_concurrent).sum()
+    }
+
+    /// Does this worker declare `kind` capability?
+    pub fn has_executor(&self, kind: &str) -> bool {
+        self.executors.iter().any(|e| e.kind == kind)
+    }
+
+    /// Derive workers from the legacy hosts list: one worker per host with
+    /// a single claude executor. Tags carry the OS so `--requires linux`
+    /// keeps working.
+    pub fn from_hosts(hosts: &[Host]) -> Vec<Worker> {
+        hosts
+            .iter()
+            .map(|h| Worker {
+                name: h.name.clone(),
+                channel: if h.ssh == "local" {
+                    "local".into()
+                } else {
+                    format!("ssh:{}", h.ssh)
+                },
+                executors: vec![ExecutorCfg {
+                    kind: "claude".into(),
+                    max_concurrent: h.max_concurrent,
+                    workdir: h.workdir.clone(),
+                }],
+                tags: vec![h.os.clone()],
+                os: h.os.clone(),
+            })
+            .collect()
+    }
 }
 
 impl FleetConfig {
@@ -74,6 +157,16 @@ impl FleetConfig {
             anyhow::bail!("no hosts in {}", p.display());
         }
         Ok(cfg)
+    }
+
+    /// All workers: declared `workers` if present, else derived from legacy
+    /// `hosts` (one claude executor per host). Never empty on valid config.
+    pub fn workers(&self) -> Vec<Worker> {
+        if self.workers.is_empty() {
+            Worker::from_hosts(&self.hosts)
+        } else {
+            self.workers.clone()
+        }
     }
 
     /// Least-loaded host with remaining capacity.
@@ -120,7 +213,7 @@ mod tests {
     }
 
     fn cfg(hosts: Vec<Host>) -> FleetConfig {
-        FleetConfig { hosts }
+        FleetConfig { hosts, workers: Vec::new() }
     }
 
     #[test]
@@ -164,5 +257,43 @@ mod tests {
         let mut h = host("w", 1, "windows");
         h.scratch = r"D:\scratch".into();
         assert_eq!(h.scratch_dir(), r"D:\scratch");
+    }
+
+    #[test]
+    fn workers_derive_from_legacy_hosts() {
+        let c = cfg(vec![host("dev", 4, "linux")]);
+        let ws = c.workers();
+        assert_eq!(ws.len(), 1);
+        assert_eq!(ws[0].name, "dev");
+        assert_eq!(ws[0].channel, "ssh:dev"); // host() helper sets ssh=name
+        assert!(ws[0].has_executor("claude"));
+        assert!(!ws[0].has_executor("shell"));
+        assert_eq!(ws[0].max_concurrent(), 4);
+    }
+
+    #[test]
+    fn declared_workers_win_over_hosts() {
+        let cfg: FleetConfig = toml::from_str(
+            r#"
+[[hosts]]
+name = "legacy"
+ssh = "local"
+[[workers]]
+name = "w1"
+channel = "ssh:imac"
+os = "windows"
+executors = [
+  { kind = "claude", max_concurrent = 2 },
+  { kind = "shell", max_concurrent = 8 },
+]
+tags = ["desktop"]
+"#,
+        )
+        .unwrap();
+        let ws = cfg.workers();
+        assert_eq!(ws.len(), 1); // declared workers replace derived ones
+        assert_eq!(ws[0].name, "w1");
+        assert!(ws[0].has_executor("shell"));
+        assert_eq!(ws[0].max_concurrent(), 10);
     }
 }
