@@ -489,7 +489,49 @@ fn main() -> Result<()> {
                     let name = args.get(3).context("usage: fleetd seat gate-check <name>")?;
                     println!("{}", if ledger::is_disabled(&c, name)? { "DISABLED" } else { "ALLOWED" });
                 }
-                _ => println!("usage: fleetd seat stop|disable|enable|list|gate-check [name]"),
+                Some("fire") => {
+                    // seat fire <name> <task-file>: paste a task one-liner into
+                    // the seat's claude composer (absorbs fire_seat.sh).
+                    let name = args.get(3).context("usage: fleetd seat fire <name> <task.md>")?;
+                    let task = args.get(4).context("usage: fleetd seat fire <name> <task.md>")?;
+                    if ledger::is_disabled(&c, name)? {
+                        anyhow::bail!("{name} is GATED — fleetd seat enable {name} first");
+                    }
+                    let has = std::process::Command::new("tmux")
+                        .args(["has-session", "-t", name])
+                        .output()?.status.success();
+                    if !has { anyhow::bail!("{name}: NO_SESSION"); }
+                    let text = format!("执行 {task} (dispatch {})", chrono::Local::now().format("%Y-%m-%d"));
+                    let mut paste = std::process::Command::new("tmux")
+                        .args(["load-buffer", "-b", "fleetd-fire", "-"])
+                        .stdin(std::process::Stdio::piped())
+                        .spawn()?;
+                    if let Some(mut stdin) = paste.stdin.take() {
+                        use std::io::Write;
+                        stdin.write_all(text.as_bytes())?;
+                    }
+                    let _ = paste.wait();
+                    let _ = std::process::Command::new("tmux")
+                        .args(["paste-buffer", "-b", "fleetd-fire", "-t", name, "-p"])
+                        .output()?;
+                    // delivery check: task path visible in the pane
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    let cap = std::process::Command::new("tmux")
+                        .args(["capture-pane", "-p", "-S", "-30", "-t", name])
+                        .output()?;
+                    let body = String::from_utf8_lossy(&cap.stdout);
+                    let delivered = body.contains(task.as_str());
+                    // fold retry (composer fold hides long text)
+                    if body.contains("paste again to expand") {
+                        let _ = std::process::Command::new("tmux")
+                            .args(["paste-buffer", "-b", "fleetd-fire", "-t", name, "-p"])
+                            .output()?;
+                        std::thread::sleep(std::time::Duration::from_secs(2));
+                    }
+                    ledger::record_dispatch(&c, name, task, None)?;
+                    println!("{name} | {}", if delivered { "DELIVERED" } else { "PASTED (verify fold)" });
+                }
+                _ => println!("usage: fleetd seat stop|disable|enable|fire|list|gate-check [name]"),
             }
         }
         Some("resources") => {
