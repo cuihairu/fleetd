@@ -12,11 +12,20 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension};
 use std::path::PathBuf;
 
+/// Home directory cross-platform: HOME first (unix/MSYS), USERPROFILE on
+/// Windows. Scheduled-task environments often lack HOME — falling back to "."
+/// resolved the db against System32 and broke every store face (2026-11-27).
+pub fn home_dir() -> String {
+    std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| ".".into())
+}
+
 pub fn db_path() -> PathBuf {
     std::env::var("FLEETD_DB")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            let home = home_dir();
             PathBuf::from(home).join(".fleetd/ledger.db")
         })
 }

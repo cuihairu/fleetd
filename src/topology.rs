@@ -109,7 +109,7 @@ pub fn pull_ship_ledger(ssh: &str, ship_name: &str) -> Result<PathBuf> {
     let local = hub_dir.join(format!("{ship_name}.db"));
     let remote_path = "~/.fleetd/ledger.db";
     let status: Result<()> = if ssh == "local" {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        let home = crate::ledger::home_dir();
         fs::copy(PathBuf::from(home).join(".fleetd/ledger.db"), &local)
             .map(|_| ())
             .map_err(|e| e.into())
