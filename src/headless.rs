@@ -143,6 +143,12 @@ pub enum RunState {
 }
 
 pub fn poll_state(host: &str, kind: &str, run_id: &str) -> RunState {
+    poll_state_quiet(host, kind, run_id, 3)
+}
+
+/// `quiet_secs` = quiescence window for agents without an explicit done
+/// event (0 = skip the wait; tests and fast callers pass 0).
+pub fn poll_state_quiet(host: &str, kind: &str, run_id: &str, quiet_secs: u64) -> RunState {
     let spec = match spec_for(kind) {
         Some(s) => s,
         None => return RunState::NotStarted,
@@ -171,7 +177,9 @@ pub fn poll_state(host: &str, kind: &str, run_id: &str) -> RunState {
     // inferred from quiescence — file size unchanged across a short window.
     if spec.ok_marker.is_empty() {
         let size_now = stream_head(host, run_id, usize::MAX).len();
-        std::thread::sleep(std::time::Duration::from_secs(3));
+        if quiet_secs > 0 {
+            std::thread::sleep(std::time::Duration::from_secs(quiet_secs));
+        }
         let size_after = stream_head(host, run_id, usize::MAX).len();
         if size_now == size_after && size_now > 0 {
             return RunState::Finished("done".into());
