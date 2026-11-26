@@ -118,6 +118,67 @@ fn open_panel() {
         .spawn();
 }
 
+fn flagship_base() -> String {
+    std::env::var("FLEETD_STATUS_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:3790/v1/status".into())
+}
+
+/// GET /v1/status → in_flight count; any failure = 0 (idle).
+fn fetch_in_flight() -> i64 {
+    fetch_status_field("in_flight")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(0)
+}
+
+/// GET /v1/status → the human status line for the menu's first row.
+fn fetch_status_line() -> Option<String> {
+    let busy = fetch_status_field("in_flight")?;
+    let version = fetch_status_field("version")?;
+    let port = std::env::var("FLEETD_PANEL_URL")
+        .ok()
+        .and_then(|u| url_port(&u))
+        .unwrap_or_else(|| 3790.to_string());
+    Some(format!("fleetd {version} — flagship :{port} ({busy} 在飞)"))
+}
+
+fn url_port(url: &str) -> Option<String> {
+    url.split("://")
+        .nth(1)?
+        .split('/')
+        .next()?
+        .split(':')
+        .nth(1)
+        .map(String::from)
+}
+
+/// One-line loopback GET returning a JSON numeric/string field.
+fn fetch_status_field(field: &str) -> Option<String> {
+    let out = Command::new("cmd")
+        .args([
+            "/C",
+            "curl",
+            "-sf",
+            "--max-time",
+            "2",
+            &flagship_base(),
+        ])
+        .creation_flags(0x0800_0000)
+        .output()
+        .ok()?;
+    let body = String::from_utf8_lossy(&out.stdout);
+    let pat = format!("\"{}\"", field);
+    let start = body.find(&pat)? + pat.len();
+    let rest = &body[start..];
+    let rest = rest.trim_start_matches(|c| c == ':' || c == ' ');
+    let end = rest.find([',', '}']).unwrap_or(rest.len());
+    let value = rest[..end].trim_matches('"').to_string();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
 /// One frame's raw RGBA pixels (top-down rows, as PIL writes them).
 pub fn frame(idx: usize) -> &'static [u8] {
     let i = idx % FRAME_COUNT;
@@ -196,11 +257,17 @@ unsafe extern "system" fn tray_wnd_proc(
                     }
                 }
             }
-            // Re-arm at the live-load cadence: more in-flight dispatches =
-            // faster gear (用户令「任务越多转动越快」). Ledger errors read as
-            // idle — the tray must never die because the db hiccuped.
-            let busy = std::panic::catch_unwind(crate::ledger::in_flight_count)
-                .unwrap_or(0);
+            // Pull status over the loopback face (2026-11-27 用户令「tray 尽量
+            // 用 UNIX socket 通信」): tray ↔ serve talk over the local status
+            // endpoint instead of shared process memory, so the tray survives
+            // serve moving to another process. Any failure reads as idle —
+            // the tray must never die because the flagship hiccuped.
+            let busy = fetch_in_flight();
+            if let Some(line) = fetch_status_line() {
+                if let Ok(mut slot) = G_STATUS.lock() {
+                    *slot = Some(line);
+                }
+            }
             SetTimer(hwnd, TIMER_ID, cadence_ms(busy), None);
             0
         }

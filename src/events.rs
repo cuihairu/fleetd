@@ -145,6 +145,30 @@ pub fn handle_stream(stream: &mut TcpStream, relay_token: Option<&str>) -> Resul
                 }
             }
         }
+        // Local status face for the tray (2026-11-27 用户令「tray 尽量用
+        // UNIX socket 通信」): loopback-only, no token — the tray pulls
+        // version/port/in-flight from here each tick instead of sharing
+        // process memory, so the tray keeps working when serve moves to
+        // another process. Non-loopback peers get 403.
+        Some("GET") if request_line.contains("/v1/status") => {
+            let peer = stream
+                .peer_addr()
+                .map(|a| a.ip().is_loopback())
+                .unwrap_or(false);
+            if !peer {
+                (403, r#"{"error":"loopback only"}"#.to_string())
+            } else {
+                let busy = crate::ledger::in_flight_count();
+                (
+                    200,
+                    format!(
+                        r#"{{"version":"{}","in_flight":{}}}"#,
+                        env!("CARGO_PKG_VERSION"),
+                        busy
+                    ),
+                )
+            }
+        }
         _ => (404, r#"{"error":"not found"}"#.to_string()),
     };
     let resp = format!(
