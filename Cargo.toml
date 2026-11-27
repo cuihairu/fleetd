@@ -1,30 +1,57 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/fleetd-core",
+    "crates/fleetd-relay",
+    "crates/fleetd-scheduler",
+    "crates/fleetd-mcp",
+    "crates/fleetd-agent",
+    "crates/fleetd-tray",
+    ".",
+]
+
+[workspace.package]
+version = "0.2.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["clock"] }
+toml = "0.8"
+rusqlite = { version = "0.32", features = ["bundled"] }
+dirs = "5"
+schemars = "1"
+
 [package]
 name = "fleetd"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
 description = "Load-aware dispatcher for claude tasks across machines (local / imac / openclaw / dev)"
-license = "MIT"
+license.workspace = true
 
 [[bin]]
 name = "fleetd"
 path = "src/main.rs"
 
 [dependencies]
-anyhow = "1"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-schemars = "1"
-chrono = { version = "0.4", features = ["clock"] }
+fleetd-core = { path = "crates/fleetd-core" }
+fleetd-relay = { path = "crates/fleetd-relay" }
+fleetd-scheduler = { path = "crates/fleetd-scheduler" }
+fleetd-mcp = { path = "crates/fleetd-mcp" }
+fleetd-agent = { path = "crates/fleetd-agent" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+schemars.workspace = true
+chrono.workspace = true
 rmcp = { version = "3.8", features = ["server", "transport-io", "macros"] }
 tokio = { version = "1", features = ["io-std", "io-util", "rt", "macros"] }
-toml = "0.8"
-rusqlite = { version = "0.32", features = ["bundled"] }
-dirs = "5"
+toml.workspace = true
+rusqlite.workspace = true
+dirs.workspace = true
 
-[target.'cfg(target_os = "linux")'.dependencies]
-pyo3 = { version = "0.30", features = ["auto-initialize"] }
-
-[target.'cfg(target_os = "windows")'.dependencies]
-pyo3 = { version = "0.30", features = ["auto-initialize", "abi3-py310"] }
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_System_LibraryLoader", "Win32_Graphics_Gdi"] }
-windows-service = "0.8"
+[profile.release]
+opt-level = 2

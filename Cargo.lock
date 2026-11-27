@@ -226,12 +226,16 @@ checksum = "1c66915cc5391097de7a2b0b972e8505aa33c0df401fd3a6811dbdb32881ba48"
 
 [[package]]
 name = "fleetd"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
  "dirs",
- "pyo3",
+ "fleetd-agent",
+ "fleetd-core",
+ "fleetd-mcp",
+ "fleetd-relay",
+ "fleetd-scheduler",
  "rmcp",
  "rusqlite",
  "schemars",
@@ -239,7 +243,101 @@ dependencies = [
  "serde_json",
  "tokio",
  "toml",
+]
+
+[[package]]
+name = "fleetd-agent"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "dirs",
+ "fleetd-core",
+ "fleetd-relay",
+ "serde",
+ "serde_json",
+ "toml",
+]
+
+[[package]]
+name = "fleetd-core"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "dirs",
+ "rusqlite",
+ "schemars",
+ "serde",
+ "serde_json",
+ "toml",
+]
+
+[[package]]
+name = "fleetd-mcp"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "dirs",
+ "fleetd-core",
+ "fleetd-register",
+ "rmcp",
+ "rusqlite",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
+]
+
+[[package]]
+name = "fleetd-register"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "fleetd-core",
+ "rusqlite",
+]
+
+[[package]]
+name = "fleetd-relay"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "dirs",
+ "fleetd-core",
+ "fleetd-register",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "toml",
+]
+
+[[package]]
+name = "fleetd-scheduler"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "dirs",
+ "fleetd-core",
+ "fleetd-relay",
+ "pyo3",
+ "rmcp",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
  "windows-service",
+]
+
+[[package]]
+name = "fleetd-tray"
+version = "0.2.0"
+dependencies = [
  "windows-sys 0.59.0",
 ]
 

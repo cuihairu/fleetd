@@ -1,0 +1,26 @@
+[package]
+name = "fleetd-scheduler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "fleetd server face: events API, scheduler, headless dispatch, pyhost, SCM service"
+
+[dependencies]
+fleetd-core = { path = "../fleetd-core" }
+fleetd-relay = { path = "../fleetd-relay" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+toml.workspace = true
+rusqlite.workspace = true
+dirs.workspace = true
+rmcp = { version = "3.8", features = ["server", "transport-io", "macros"] }
+tokio = { version = "1", features = ["io-std", "io-util", "rt", "macros"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+pyo3 = { version = "0.30", features = ["auto-initialize"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+pyo3 = { version = "0.30", features = ["auto-initialize", "abi3-py310"] }
+windows-service = "0.8"

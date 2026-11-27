@@ -1,0 +1,16 @@
+[package]
+name = "fleetd-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "fleetd core: ledger, config, dispatch, jobs, topology (no server IO face)"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+toml.workspace = true
+rusqlite.workspace = true
+dirs.workspace = true
+schemars.workspace = true

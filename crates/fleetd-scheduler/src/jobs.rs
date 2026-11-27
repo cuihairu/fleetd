@@ -7,7 +7,7 @@ use rusqlite::Connection;
 /// Add or update a job. `fleetd job add <name> <schedule> <command>`.
 pub fn job_add(c: &Connection, name: &str, schedule: &str, command: &str) -> Result<()> {
     // validate schedule before writing
-    let parsed = crate::scheduler::parse_schedule(schedule)?;
+    let parsed = fleetd_core::schedule::parse_schedule(schedule)?;
     let ts_now = unix_now();
     c.execute(
         "INSERT INTO jobs(name,schedule,command,enabled,created_at) VALUES(?1,?2,?3,1,?4)
@@ -18,10 +18,10 @@ pub fn job_add(c: &Connection, name: &str, schedule: &str, command: &str) -> Res
     Ok(())
 }
 
-fn parsed_display(s: &crate::scheduler::Schedule) -> String {
+fn parsed_display(s: &fleetd_core::schedule::Schedule) -> String {
     match s {
-        crate::scheduler::Schedule::Cron(x) => x.clone(),
-        crate::scheduler::Schedule::Interval { minutes } => format!("every {minutes}m"),
+        fleetd_core::schedule::Schedule::Cron(x) => x.clone(),
+        fleetd_core::schedule::Schedule::Interval { minutes } => format!("every {minutes}m"),
     }
 }
 
@@ -107,7 +107,7 @@ pub fn job_stats(c: &Connection, name: Option<&str>) -> Result<()> {
         st.query_map([], row_map)?.collect::<std::result::Result<Vec<_>, _>>()?
     };
     for (n, runs, ok, avg, last) in rows {
-        let t = crate::scheduler::ts(last).format("%m-%d %H:%M").to_string();
+        let t = fleetd_core::schedule::ts(last).format("%m-%d %H:%M").to_string();
         println!("{n:<28} {runs:>6} {ok:>6} {avg:>9.1} {t:>18}");
     }
     Ok(())
@@ -121,7 +121,7 @@ fn row_map(r: &rusqlite::Row<'_>) -> rusqlite::Result<(String, i64, i64, f64, i6
 /// Returns count of jobs run. Used by the daemon background thread.
 pub fn tick(c: &Connection) -> Result<usize> {
     let now_ts = unix_now();
-    let now_dt = crate::scheduler::ts(now_ts);
+    let now_dt = fleetd_core::schedule::ts(now_ts);
     let jobs: Vec<(i64, String, String, Option<i64>)> = {
         let mut st = c.prepare(
             "SELECT id, name, schedule, last_run FROM jobs WHERE enabled=1",
@@ -134,12 +134,12 @@ pub fn tick(c: &Connection) -> Result<usize> {
     };
     let mut ran = 0;
     for (id, name, schedule, last) in jobs {
-        let spec = match crate::scheduler::parse_schedule(&schedule) {
+        let spec = match fleetd_core::schedule::parse_schedule(&schedule) {
             Ok(s) => s,
             Err(e) => { eprintln!("bad schedule for {name}: {e}"); continue; }
         };
-        let last_dt = last.map(crate::scheduler::ts);
-        if !crate::scheduler::is_due(&spec, &now_dt, last_dt.as_ref()) {
+        let last_dt = last.map(fleetd_core::schedule::ts);
+        if !fleetd_core::schedule::is_due(&spec, &now_dt, last_dt.as_ref()) {
             continue;
         }
         let command: String = match c.query_row(

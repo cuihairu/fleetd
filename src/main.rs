@@ -1,36 +1,21 @@
-mod agent;
-mod agent_loop;
-mod config;
-mod dispatcher;
-mod events;
-mod fleet_view;
 // Headless dispatch channel (2026-11-27): spawn `claude -p` per task, JSONL
 // event stream as the source of truth; tmux demoted to debug surface.
-mod headless;
-mod ledger;
-mod jobs;
-mod mcp_server;
-mod probe;
-mod relay;
-mod resources;
-mod summary;
-mod tools;
-mod topology;
-
-// Windows tray (wood gear, rotating frames); compiled only on windows targets.
-#[cfg(target_os = "windows")]
-mod scm_service;
-mod tray;
-
 // Embedded CPython (PyO3): linux flagship links system libpython; windows seats
 // link python3.dll (abi3) and use the bundled runtime/ directory. See pyhost.
-#[cfg(any(target_os = "linux", target_os = "windows"))]
-mod pyhost;
-mod scheduler;
-mod service;
+// Windows tray: standalone fleetd-tray.exe (crates/fleetd-tray).
 
-use anyhow::{bail, Context, Result};
-use config::{FleetConfig, Host};
+use anyhow::{Context, Result};
+use fleetd_core::config::{FleetConfig, Host};
+// Unified entry aliases after the workspace split (2026-11-27): call
+// sites keep their short paths — the split moves boundaries only.
+use fleetd_agent::agent_loop;
+use fleetd_core::{fleet_view, ledger, probe, resources, topology};
+use fleetd_scheduler::jobs;
+#[cfg(target_os = "windows")]
+use fleetd_scheduler::scm_service;
+use fleetd_scheduler::{events, headless, pyhost, scheduler, service};
+use fleetd_mcp::mcp_server;
+use fleetd_mcp::tools;
 use rusqlite::Connection;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -64,7 +49,7 @@ fn count_claude(h: &Host) -> Result<usize> {
 
     // ssh non-zero exit = unreachable / auth failure -> treat as Err.
     if h.ssh != "local" && !out.status.success() {
-        bail!("host {} unreachable (ssh exit {})", h.name, out.status);
+        anyhow::bail!("host {} unreachable (ssh exit {})", h.name, out.status);
     }
 
     let text = String::from_utf8_lossy(&out.stdout).to_string();
@@ -317,7 +302,7 @@ fn dispatch(cfg: &FleetConfig, task_file: &str, repo: &str) -> Result<()> {
         );
         let status = Command::new("bash").arg("-c").arg(&cmd).status()?;
         if !status.success() {
-            bail!("local launch failed");
+            anyhow::bail!("local launch failed");
         }
     } else {
         // copy task file then run in workdir
@@ -328,7 +313,7 @@ fn dispatch(cfg: &FleetConfig, task_file: &str, repo: &str) -> Result<()> {
             .status()?
             .success();
         if !scp_ok {
-            bail!("scp to {} failed", host.ssh);
+            anyhow::bail!("scp to {} failed", host.ssh);
         }
         let remote_cmd = if host.os == "windows" {
             format!(
@@ -346,7 +331,7 @@ fn dispatch(cfg: &FleetConfig, task_file: &str, repo: &str) -> Result<()> {
             .arg(&remote_cmd)
             .status()?;
         if !status.success() {
-            bail!("remote launch on {} failed", host.ssh);
+            anyhow::bail!("remote launch on {} failed", host.ssh);
         }
     }
 
@@ -388,7 +373,7 @@ fn main() -> Result<()> {
     if args.get(1).map(String::as_str) == Some("tray") {
         #[cfg(target_os = "windows")]
         {
-            crate::tray::spawn();
+            fleetd_tray::spawn();
             return Ok(());
         }
         #[cfg(not(target_os = "windows"))]
@@ -750,11 +735,11 @@ fn main() -> Result<()> {
                     let seat = args.get(3).context("usage: fleetd relay queue <seat> <task.md> <repo>")?;
                     let task_file = args.get(4).context("usage: fleetd relay queue <seat> <task.md> <repo>")?;
                     let repo = args.get(5).context("usage: fleetd relay queue <seat> <task.md> <repo>")?;
-                    let id = crate::relay::queue_pull(seat, task_file, repo)?;
+                    let id = fleetd_relay::forward::queue_pull(seat, task_file, repo)?;
                     println!("queued pull id={id} seat={seat} (delivered on next heartbeat)");
                 }
                 Some("alive") => {
-                    for (seat, ts) in crate::relay::alive_since(15)? {
+                    for (seat, ts) in fleetd_relay::relay::alive_since(15)? {
                         println!("{seat} last-heartbeat {ts}s-epoch");
                     }
                 }
@@ -903,7 +888,7 @@ fn main() -> Result<()> {
                     println!("installing {} on {host} (official installer)...", tool.name());
                     match tools::install(host, tool) {
                         Ok(v) => println!("OK: {} now {v}", tool.name()),
-                        Err(e) => bail!("install failed: {e}"),
+                        Err(e) => anyhow::bail!("install failed: {e}"),
                     }
                 }
                 _ => {
@@ -977,14 +962,21 @@ fn run_serve_cli(args: &[String]) -> Result<()> {
         .unwrap_or(3790u16);
     if !args.iter().any(|a| a == "--no-scheduler") {
         std::thread::spawn(|| {
-            crate::scheduler::serve(|| {
-                let c = crate::ledger::open()?;
-                crate::jobs::tick(&c)
+            fleetd_scheduler::scheduler::serve(|| {
+                let c = fleetd_core::ledger::open()?;
+                fleetd_scheduler::jobs::tick(&c)
             });
         });
     }
-    let bind = if args.iter().any(|a| a == "--public") { "0.0.0.0" } else { "127.0.0.1" };
-    events::serve_on(bind, port)?;
+    // 通信面(2026-11-27 钦定):本机默认走 UNIX socket(~/.fleetd/flagship.sock,
+    // Windows 同 AF_UNIX);--http 显式开启才起 TCP HTTP 面(跨机 relay/面板)。
+    let http = args.iter().any(|a| a == "--http");
+    if http {
+        let bind = if args.iter().any(|a| a == "--public") { "0.0.0.0" } else { "127.0.0.1" };
+        events::serve_on(bind, port)?;
+    } else {
+        events::serve_on_unix(&fleetd_scheduler::events::flagship_socket_path())?;
+    }
     Ok(())
 }
 

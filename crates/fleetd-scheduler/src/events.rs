@@ -12,8 +12,12 @@
 use anyhow::{bail, Context, Result};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+#[cfg(unix)]
+use std::os::unix::net::UnixListener;
+#[cfg(windows)]
+use std::os::windows::net::UnixListener;
 
-use crate::ledger::{self, SeatEvent};
+use fleetd_core::ledger::{self, SeatEvent};
 
 const MAX_BODY: usize = 256 * 1024;
 
@@ -47,18 +51,46 @@ pub fn ingest_and_dispatch(raw: &str, auto: bool) -> Result<(String, String)> {
     let open = ev.open.unwrap_or(0);
     let dirty = ev.dirty.unwrap_or(0);
     // No queued tag source yet (queue lands later); nudge todo when open.
-    let decision = crate::dispatcher::decide(
+    let decision = fleetd_core::dispatcher::decide(
         v, open, None, dirty, true, true, false,
     );
     let summary = match &decision {
-        crate::dispatcher::Decision::Noop { reason } => format!("noop: {reason}"),
+        fleetd_core::dispatcher::Decision::Noop { reason } => format!("noop: {reason}"),
         _ => format!("would: {:?}", decision),
     };
     Ok((verdict.as_str().into(), summary))
 }
 
 /// Minimal HTTP/1.1 handler — no framework. Reads one request, answers JSON.
-pub fn handle_stream(stream: &mut TcpStream, relay_token: Option<&str>) -> Result<()> {
+/// Peer-address abstraction: TCP streams expose a peer IP for the loopback
+/// gate; UDS carries none — the socket file itself is the local boundary.
+trait PeerAddr {
+    fn peer_addr(&self) -> std::io::Result<Option<std::net::SocketAddr>>;
+}
+
+impl PeerAddr for std::net::TcpStream {
+    fn peer_addr(&self) -> std::io::Result<Option<std::net::SocketAddr>> {
+        std::net::TcpStream::peer_addr(self).map(Some)
+    }
+}
+
+#[cfg(unix)]
+impl PeerAddr for std::os::unix::net::UnixStream {
+    fn peer_addr(&self) -> std::io::Result<Option<std::net::SocketAddr>> {
+        Ok(None)
+    }
+}
+
+#[cfg(windows)]
+impl PeerAddr for std::os::windows::net::UnixStream {
+    fn peer_addr(&self) -> std::io::Result<Option<std::net::SocketAddr>> {
+        Ok(None)
+    }
+}
+
+/// 泛化到 Read+Write:HTTP 解析只做读写,UnixListener/插座面同链路复用
+/// (2026-11-27 UNIX socket 默认面拆分)。
+pub fn handle_stream<S: Read + Write + PeerAddr>(stream: &mut S, relay_token: Option<&str>) -> Result<()> {
     let mut buf = Vec::with_capacity(8192);
     let mut tmp = [0u8; 4096];
     let header_end;
@@ -121,7 +153,7 @@ pub fn handle_stream(stream: &mut TcpStream, relay_token: Option<&str>) -> Resul
             if !token_ok {
                 (403, r#"{"error":"forbidden"}"#.to_string())
             } else {
-                match crate::relay::heartbeat(&body) {
+                match fleetd_relay::relay::heartbeat(&body) {
                     Ok(reply) => match serde_json::to_string(&reply) {
                         Ok(j) => (200, j),
                         Err(e) => (500, format!(r#"{{"error":"{}"}}"#, e)),
@@ -136,7 +168,7 @@ pub fn handle_stream(stream: &mut TcpStream, relay_token: Option<&str>) -> Resul
             if !token_ok {
                 (403, r#"{"error":"forbidden"}"#.to_string())
             } else {
-                match crate::summary::build(7) {
+                match fleetd_core::summary::build(7) {
                     Ok(s) => match serde_json::to_string(&s) {
                         Ok(j) => (200, j),
                         Err(e) => (500, format!(r#"{{"error":"{}"}}"#, e)),
@@ -151,14 +183,18 @@ pub fn handle_stream(stream: &mut TcpStream, relay_token: Option<&str>) -> Resul
         // process memory, so the tray keeps working when serve moves to
         // another process. Non-loopback peers get 403.
         Some("GET") if request_line.contains("/v1/status") => {
-            let peer = stream
-                .peer_addr()
+            // Loopback gate: TCP peers must be loopback; UDS has no peer
+            // address — the socket file itself is the local boundary, so a
+            // successful connect already proves same-machine.
+            let peer = PeerAddr::peer_addr(stream)
+                .ok()
+                .flatten()
                 .map(|a| a.ip().is_loopback())
-                .unwrap_or(false);
+                .unwrap_or(true);
             if !peer {
                 (403, r#"{"error":"loopback only"}"#.to_string())
             } else {
-                let busy = crate::ledger::in_flight_count();
+                let busy = fleetd_core::ledger::in_flight_count();
                 (
                     200,
                     format!(
@@ -187,6 +223,64 @@ fn find_double_crlf(buf: &[u8]) -> Option<usize> {
 /// Serve events forever on `bind_addr`. Blocks the caller. Pass "127.0.0.1"
 /// for the loopback-only default, or "0.0.0.0" when agents reach the flagship
 /// over the network (fleetd agent pull mode / dev public relay).
+/// 本机 socket 面(2026-11-27 默认):AF_UNIX,路径 ~/.fleetd/flagship.sock。
+/// Windows 10 1803+ 原生 AF_UNIX(std::os::windows::net::UnixListener 同 API)。
+/// 每次 bind 前清残留 socket 文件。
+#[cfg(unix)]
+pub fn serve_on_unix(sock_path: &std::path::Path) -> Result<()> {
+    let relay_token = std::env::var("FLEETD_RELAY_TOKEN").ok().filter(|t| !t.is_empty());
+    if let Some(dir) = sock_path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| "create socket dir")?;
+    }
+    let _ = std::fs::remove_file(sock_path); // stale socket from a crashed run
+    let listener = UnixListener::bind(sock_path)
+        .with_context(|| format!("bind unix socket {sock_path:?}"))?;
+    eprintln!("fleetd flagship socket: {sock_path:?} (local tray face)");
+    for stream in listener.incoming() {
+        match stream {
+            Ok(mut s) => {
+                if let Err(e) = handle_stream(&mut s, relay_token.as_deref()) {
+                    eprintln!("event handling error: {e:#}");
+                }
+            }
+            Err(e) => eprintln!("accept error: {e:#}"),
+        }
+    }
+    Ok(())
+}
+
+/// Windows 侧 AF_UNIX 面(签名一致;Windows 10 1803+ 支持)。
+#[cfg(windows)]
+pub fn serve_on_unix(sock_path: &std::path::Path) -> Result<()> {
+    let relay_token = std::env::var("FLEETD_RELAY_TOKEN").ok().filter(|t| !t.is_empty());
+    if let Some(dir) = sock_path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| "create socket dir")?;
+    }
+    let _ = std::fs::remove_file(sock_path);
+    let listener = UnixListener::bind(sock_path)
+        .with_context(|| format!("bind unix socket {sock_path:?}"))?;
+    eprintln!("fleetd flagship socket: {sock_path:?} (local tray face)");
+    for stream in listener.incoming() {
+        match stream {
+            Ok(mut s) => {
+                if let Err(e) = handle_stream(&mut s, relay_token.as_deref()) {
+                    eprintln!("event handling error: {e:#}");
+                }
+            }
+            Err(e) => eprintln!("accept error: {e:#}"),
+        }
+    }
+    Ok(())
+}
+
+/// Socket 路径约定:~/.fleetd/flagship.sock(全平台同一规则)。
+pub fn flagship_socket_path() -> std::path::PathBuf {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| ".".into());
+    std::path::Path::new(&home).join(".fleetd").join("flagship.sock")
+}
+
 pub fn serve_on(bind_addr: &str, port: u16) -> Result<()> {
     let relay_token = std::env::var("FLEETD_RELAY_TOKEN").ok().filter(|t| !t.is_empty());
     if relay_token.is_some() && bind_addr != "127.0.0.1" {

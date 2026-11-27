@@ -71,12 +71,12 @@ impl FleetMcp {
         description = "Fleet seat status: recent dispatch counts and outcomes for a seat (omit name for all). Read-only."
     )]
     pub async fn seat_status(&self, Parameters(query): Parameters<SeatQuery>) -> String {
-        let c = match crate::ledger::open() {
+        let c = match fleetd_core::ledger::open() {
             Ok(c) => c,
             Err(e) => return format!("ledger error: {e}"),
         };
         let mut out = String::new();
-        let rows = match crate::ledger::progress(&c, 1) {
+        let rows = match fleetd_core::ledger::progress(&c, 1) {
             Ok(r) => r,
             Err(e) => return format!("progress error: {e}"),
         };
@@ -103,7 +103,7 @@ impl FleetMcp {
         description = "List fleetd scheduled jobs with schedule and run counts. Read-only."
     )]
     pub async fn job_list(&self) -> String {
-        let c = match crate::ledger::open() {
+        let c = match fleetd_core::ledger::open() {
             Ok(c) => c,
             Err(e) => return format!("ledger error: {e}"),
         };
@@ -144,11 +144,11 @@ impl FleetMcp {
         description = "Register a scheduled shell job (cron 5-field like '*/5 * * * *', or interval like 'every 15m'). Use this INSTEAD of editing crontab: runs are tracked with statistics in the fleet ledger."
     )]
     pub async fn job_add(&self, Parameters(query): Parameters<JobAddQuery>) -> String {
-        let parsed = match crate::scheduler::parse_schedule(&query.schedule) {
+        let parsed = match fleetd_core::schedule::parse_schedule(&query.schedule) {
             Ok(p) => p,
             Err(e) => return format!("bad schedule: {e}"),
         };
-        let c = match crate::ledger::open() {
+        let c = match fleetd_core::ledger::open() {
             Ok(c) => c,
             Err(e) => return format!("ledger error: {e}"),
         };
@@ -157,8 +157,8 @@ impl FleetMcp {
             .unwrap_or_default()
             .as_secs() as i64;
         let display = match parsed {
-            crate::scheduler::Schedule::Cron(x) => x,
-            crate::scheduler::Schedule::Interval { minutes } => format!("every {minutes}m"),
+            fleetd_core::schedule::Schedule::Cron(x) => x,
+            fleetd_core::schedule::Schedule::Interval { minutes } => format!("every {minutes}m"),
         };
         match c.execute(
             "INSERT INTO jobs(name,schedule,command,enabled,created_at) VALUES(?1,?2,?3,1,?4)
@@ -176,7 +176,7 @@ impl FleetMcp {
         description = "Run statistics (runs / ok / avg seconds / last run time) for a scheduled job, or all jobs when name is omitted."
     )]
     pub async fn job_stats(&self, Parameters(query): Parameters<JobNameQuery>) -> String {
-        let c = match crate::ledger::open() {
+        let c = match fleetd_core::ledger::open() {
             Ok(c) => c,
             Err(e) => return format!("ledger error: {e}"),
         };
@@ -198,7 +198,7 @@ impl FleetMcp {
             .unwrap_or_default();
         let mut out = String::from("name | runs | ok | avg_sec | last\n");
         for (name, runs, ok, avg, last) in rows {
-            let t = crate::scheduler::ts(last).format("%m-%d %H:%M").to_string();
+            let t = fleetd_core::schedule::ts(last).format("%m-%d %H:%M").to_string();
             out.push_str(&format!("{name} | {runs} | {ok} | {avg} | {t}\n"));
         }
         out
@@ -210,7 +210,7 @@ impl FleetMcp {
         description = "Remove a scheduled job by name. Run history is kept."
     )]
     pub async fn job_remove(&self, Parameters(query): Parameters<JobNameQuery>) -> String {
-        let c = match crate::ledger::open() {
+        let c = match fleetd_core::ledger::open() {
             Ok(c) => c,
             Err(e) => return format!("ledger error: {e}"),
         };

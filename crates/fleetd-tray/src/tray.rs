@@ -154,23 +154,32 @@ fn url_port(url: &str) -> Option<String> {
 }
 
 /// One-line loopback GET returning a JSON numeric/string field.
+/// Tray↔flagship 本机通信(2026-11-27 钦定):UNIX socket(Windows 10 1803+
+/// 原生 AF_UNIX,std 同 API),不走 loopback TCP。路径与 flagship serve 一致:
+/// %USERPROFILE%\.fleetd\flagship.sock。覆盖 FLEETD_STATUS_URL 仅在测试用。
 fn fetch_status_field(field: &str) -> Option<String> {
-    let out = Command::new("cmd")
-        .args([
-            "/C",
-            "curl",
-            "-sf",
-            "--max-time",
-            "2",
-            &flagship_base(),
-        ])
-        .creation_flags(0x0800_0000)
-        .output()
-        .ok()?;
-    let body = String::from_utf8_lossy(&out.stdout);
+    use std::io::{Read as _, Write as _};
+
+    let path = std::env::var("FLEETD_STATUS_SOCK")
+        .unwrap_or_else(|_| {
+            let home = std::env::var("USERPROFILE")
+                .or_else(|_| std::env::var("HOME"))
+                .unwrap_or_else(|_| ".".into());
+            format!("{home}\\.fleetd\\flagship.sock")
+        });
+    let mut stream = uds::UnixStream::connect(path).ok()?;
+    let _ = stream.write_all(
+        format!("GET /v1/status HTTP/1.1\r\nHost: flagship\r\nConnection: close\r\n\r\n").as_bytes(),
+    );
+    let mut body = Vec::new();
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+    let _ = stream.read_to_end(&mut body);
+    let body = String::from_utf8_lossy(&body);
+    // HTTP response: skip headers (first empty line), then parse JSON field.
+    let json = body.split("\r\n\r\n").nth(1).unwrap_or("");
     let pat = format!("\"{}\"", field);
-    let start = body.find(&pat)? + pat.len();
-    let rest = &body[start..];
+    let start = json.find(&pat)? + pat.len();
+    let rest = &json[start..];
     let rest = rest.trim_start_matches(|c| c == ':' || c == ' ');
     let end = rest.find([',', '}']).unwrap_or(rest.len());
     let value = rest[..end].trim_matches('"').to_string();
@@ -318,10 +327,16 @@ unsafe extern "system" fn tray_wnd_proc(
 
 /// Spawn the tray on a dedicated thread. Returns a handle whose drop asks the
 /// tray to remove its icon and exit; failures are silent by design.
+/// Window-thread handle for the standalone tray process (main blocks on
+/// it: a returning main = process exit = instant tray death, seen live on
+/// cuihaitao 2026-11-27).
+static TRAY_THREAD: std::sync::Mutex<Option<std::thread::JoinHandle<()>>> =
+    std::sync::Mutex::new(None);
+
 pub fn spawn() -> Option<StopHandle> {
-    std::thread::Builder::new()
+    let handle = std::thread::Builder::new()
         .name("fleetd-tray".into())
-        .spawn(|| unsafe {
+        .spawn(move || unsafe {
             let class_name: Vec<u16> = "FleetdTrayHost\0".encode_utf16().collect();
             let wc = WNDCLASSEXW {
                 cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
@@ -390,7 +405,26 @@ pub fn spawn() -> Option<StopHandle> {
             }
         })
         .ok()?;
+    if let Ok(mut slot) = TRAY_THREAD.lock() {
+        let prev = slot.replace(handle);
+        if let Some(prev) = prev {
+            let _ = prev.join();
+        }
+    }
     Some(StopHandle)
+}
+
+/// standalone 进程主线程阻塞:窗口线程活着进程就活着;用户菜单退出路径
+/// process::exit(0) 直接收进程,不需要跨线程协调。
+pub fn wait_forever() {
+    loop {
+        let handle = TRAY_THREAD.lock().ok().and_then(|mut s| s.take());
+        if let Some(h) = handle {
+            let _ = h.join();
+            std::process::exit(0);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
 }
 
 pub struct StopHandle;

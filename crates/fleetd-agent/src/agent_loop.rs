@@ -36,7 +36,7 @@ fn default_interval() -> u64 {
 }
 
 pub fn load_or_init(flagship: Option<&str>, token: Option<&str>, seat: Option<&str>) -> Result<AgentConfig> {
-    let home = crate::ledger::home_dir();
+    let home = fleetd_core::ledger::home_dir();
     let conf_path = std::path::Path::new(&home).join(AGENT_CONF);
     load_from(&conf_path, flagship, token, seat)
 }
@@ -148,7 +148,7 @@ fn beat(cfg: &AgentConfig, workdir: &str) -> Option<(String, String, String)> {
 /// The loop. Runs forever: beat → maybe execute → sleep. Callers never see
 /// an Err from individual beats (they are logged and skipped).
 pub fn run_loop(cfg: AgentConfig, workdir: &str, permission_mode: &str) -> Result<()> {
-    let home = crate::ledger::home_dir();
+    let home = fleetd_core::ledger::home_dir();
     let runs_dir = std::path::Path::new(&home).join(".fleetd/agent-runs");
     std::fs::create_dir_all(&runs_dir).ok();
     println!(
