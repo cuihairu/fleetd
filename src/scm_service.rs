@@ -32,8 +32,14 @@ pub fn run() -> windows_service::Result<()> {
 }
 
 fn fleetd_service_main(args: Vec<std::ffi::OsString>) {
+    // SCM context has no stderr — persist any failure to FLEETD_SVC_ERR so
+    // remote debugging can read it (stdout/stderr are unusable in SCM).
     if let Err(e) = run_service(args) {
-        eprintln!("fleetd service error: {e:?}");
+        let msg = format!("fleetd service error: {e:?}\n");
+        let _ = std::fs::write(
+            std::env::var("FLEETD_SVC_ERR").unwrap_or_else(|_| "C:\\fleetd-svc-err.txt".into()),
+            msg,
+        );
     }
 }
 
@@ -58,6 +64,9 @@ fn run_service(_args: Vec<std::ffi::OsString>) -> windows_service::Result<()> {
     // channel and shut down cleanly.
     let serve_thread = std::thread::Builder::new()
         .name("fleetd-serve".into())
+        // 32 MiB: the serve stack hosts pyhost init with deep frames; the
+        // 2 MiB default overflow-killed the whole process (7031 hunt).
+        .stack_size(32 * 1024 * 1024)
         .spawn(|| {
             if let Err(e) = crate::run_serve_from_service() {
                 eprintln!("fleetd serve error: {e:#}");
@@ -65,8 +74,14 @@ fn run_service(_args: Vec<std::ffi::OsString>) -> windows_service::Result<()> {
         })
         .map_err(|e| windows_service::Error::Winapi(e.into()))?;
 
-    // Block until SCM says stop.
-    let _ = rx.recv_timeout(Duration::from_secs(u64::MAX / 2 - 1));
+    // Block until SCM says stop (1 s polling keeps shutdown responsive and
+    // treats a dropped handler channel as stop).
+    loop {
+        match rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+        }
+    }
     let _ = serve_thread;
 
     status_handle.set_service_status(stopped_status())?;
