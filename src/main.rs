@@ -8,14 +8,22 @@ use anyhow::{Context, Result};
 use fleetd_core::config::{FleetConfig, Host};
 // Unified entry aliases after the workspace split (2026-11-27): call
 // sites keep their short paths — the split moves boundaries only.
-use fleetd_agent::agent_loop;
-use fleetd_core::{fleet_view, ledger, probe, resources, topology};
-use fleetd_scheduler::jobs;
+use agent::agent_loop;
+use fleetd_core::topology;
+use report::{fleet_view, summary};
+use store::ledger;
+use probe::probe;
+use store::resources;
+use scheduler::jobs;
 #[cfg(target_os = "windows")]
-use fleetd_scheduler::scm_service;
-use fleetd_scheduler::{events, headless, pyhost, scheduler, service};
-use fleetd_mcp::mcp_server;
-use fleetd_mcp::tools;
+use service::scm_service;
+use scheduler::{events, headless, pyhost};
+// The `scheduler` submodule must NOT be imported under its own name: it
+// shadows the crate, making every `scheduler::jobs` resolve to the module.
+use scheduler::scheduler as sched;
+use service as svc;
+use mcp::mcp_server;
+use mcp::tools;
 use rusqlite::Connection;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -367,13 +375,13 @@ fn main() -> Result<()> {
     // a remote ship has no ~/.hermes/fleet.toml and still must come up.
     let needs_hosts = matches!(
         args.get(1).map(String::as_str),
-        Some("status") | Some("hosts") | Some("cleanup") | Some("dispatch") | None
+        Some("status") | Some("hosts") | Some("cleanup") | Some("dispatch-file") | None
     );
     // --- standalone tray process: fleetd tray (pulls /v1/status) ---
     if args.get(1).map(String::as_str) == Some("tray") {
         #[cfg(target_os = "windows")]
         {
-            fleetd_tray::spawn();
+            tray::spawn();
             return Ok(());
         }
         #[cfg(not(target_os = "windows"))]
@@ -597,6 +605,68 @@ fn main() -> Result<()> {
                 _ => println!("usage: fleetd seat stop|disable|enable|fire|list|gate-check [name]"),
             }
         }
+        Some("blocked") => {
+            // blocked — list every seat's blocked todo items so the user can
+            // pick one, resolve it interactively (attach / provide creds /
+            // approve), then unblock. These are exactly the items the
+            // scheduler no longer burns cycles on (blocked != open).
+            let root = std::path::Path::new("/home/cui/workspaces");
+            let mut any = false;
+            let mut entries: Vec<(String, i64)> = Vec::new();
+            let rd = std::fs::read_dir(root)?;
+            for e in rd { let e = e?;
+                if !e.file_type()?.is_dir() {
+                    continue;
+                }
+                let seat = e.file_name().to_string_lossy().to_string();
+                let todo = e.path().join("todo.md");
+                let todo = if todo.exists() {
+                    todo
+                } else {
+                    let t = e.path().join("TODO.md");
+                    if t.exists() { t } else { continue }
+                };
+                let body = std::fs::read_to_string(&todo).unwrap_or_default();
+                // open items carrying a blocker marker, same rule as the hook
+                let lines: Vec<&str> = body
+                    .lines()
+                    .filter(|l| {
+                        let t = l.trim_start();
+                        t.starts_with("- [ ]")
+                    })
+                    .collect();
+                let open = lines.len() as i64;
+                if open == 0 {
+                    continue;
+                }
+                let blocked: Vec<&str> = lines
+                    .into_iter()
+                    .filter(|l| l.contains("BLOCKED") || l.contains("阻塞") || l.contains('⛔'))
+                    .collect();
+                if blocked.is_empty() {
+                    continue;
+                }
+                entries.push((seat.clone(), blocked.len() as i64));
+                println!("== {seat} (open={open}, blocked={}) ==", blocked.len());
+                for l in &blocked {
+                    let t = l.trim();
+                    // first line of the item + any BLOCKED marker, trimmed to 110 cols
+                    let snippet: String = t.chars().take(110).collect();
+                    println!("  {snippet}");
+                }
+                any = true;
+            }
+            if any {
+                let total: i64 = entries.iter().map(|(_, b)| b).sum();
+                println!(
+                    "\n{} seat(s), {} blocked item(s). Resolve one (attach / provide creds / approve), then clear its marker — the scheduler picks it up automatically.",
+                    entries.len(),
+                    total
+                );
+            } else {
+                println!("no blocked items anywhere");
+            }
+        }
         Some("resources") => {
             let c = ledger::open()?;
             resources::init(&c).context("init resources table")?;
@@ -675,12 +745,113 @@ fn main() -> Result<()> {
         Some("hosts") => hosts(cfg.as_ref().context("config required")?)?,
         Some("cleanup") => cleanup(cfg.as_ref().context("config required")?)?,
         Some("dispatch") => {
+            // Natural-language dispatch: fleetd dispatch "修一下 kode 的登录超时"
+            // — resolves repo by fuzzy match over /home/cui/workspaces (name +
+            // todo content), picks an idle seat on the resolved repo, fires.
+            // No IDs, no file paths — the user speaks, fleetd finds the target.
+            let nl = args[2..].join(" ");
+            anyhow::ensure!(!nl.is_empty(), "usage: fleetd dispatch \"自然语言任务描述\"");
+            let c = ledger::open()?;
+            let root = std::path::Path::new("/home/cui/workspaces");
+            // score every workspace dir against the description (name tokens + todo hits)
+            let mut scored: Vec<(i64, String)> = Vec::new();
+            let nl_low = nl.to_lowercase();
+            let tokens: Vec<&str> = nl_low
+                .split(|ch: char| !ch.is_ascii_alphanumeric())
+                .filter(|t| t.len() >= 2)
+                .collect();
+            let rd = std::fs::read_dir(root)?;
+            for e in rd { let e = e?;
+                if !e.file_type()?.is_dir() {
+                    continue;
+                }
+                let name = e.file_name().to_string_lossy().to_lowercase();
+                let mut score = 0i64;
+                for t in &tokens {
+                    // Exact workspace-name match dominates: a worktree copy
+                    // (e.g. pentimento-ui) has a bigger todo and would win on
+                    // raw token frequency, but the user naming a repo means
+                    // that repo, not its double.
+                    if name == *t {
+                        score += 1000;
+                    } else if name.contains(t) {
+                        score += 10;
+                    }
+                }
+                let todo = e.path().join("todo.md");
+                let todo = if todo.exists() {
+                    todo
+                } else {
+                    let t2 = e.path().join("TODO.md");
+                    if t2.exists() { t2 } else {
+                        if score > 0 { scored.push((score, e.file_name().to_string_lossy().to_string())); }
+                        continue;
+                    }
+                };
+                let body = std::fs::read_to_string(&todo).unwrap_or_default().to_lowercase();
+                for t in &tokens {
+                    // count token hits inside the todo body (capped to avoid flood)
+                    let hits = body.matches(t).count().min(20) as i64;
+                    score += hits;
+                }
+                if score > 0 {
+                    scored.push((score, e.file_name().to_string_lossy().to_string()));
+                }
+            }
+            scored.sort_by(|a, b| b.0.cmp(&a.0));
+            let (top_score, seat_dir) = scored
+                .first()
+                .cloned()
+                .context("no workspace matched the description; name the repo explicitly")?;
+            let runner = scored
+                .get(1)
+                .filter(|(s, _)| *s >= top_score / 2)
+                .map(|(_, n)| n.as_str());
+            match runner {
+                Some(r) => println!("match: {seat_dir} (also near: {r})"),
+                None => println!("match: {seat_dir}"),
+            }
+            // fire the natural-language task itself (seat fire handles tmux paste)
+            let task = nl.clone();
+            let has = std::process::Command::new("tmux")
+                .args(["has-session", "-t", &seat_dir])
+                .output()?.status.success();
+            if !has { anyhow::bail!("{seat_dir}: NO_SESSION — cannot deliver"); }
+            if ledger::is_disabled(&c, &seat_dir)? {
+                anyhow::bail!("{seat_dir} is GATED — fleetd seat enable {seat_dir} first");
+            }
+            let text = format!("{task} (fleetd dispatch {})", chrono::Local::now().format("%Y-%m-%d %H:%M"));
+            let mut paste = std::process::Command::new("tmux")
+                .args(["load-buffer", "-b", "fleetd-fire", "-"])
+                .stdin(std::process::Stdio::piped())
+                .spawn()?;
+            if let Some(mut stdin) = paste.stdin.take() {
+                use std::io::Write;
+                stdin.write_all(text.as_bytes())?;
+            }
+            let _ = paste.wait();
+            let _ = std::process::Command::new("tmux")
+                .args(["paste-buffer", "-b", "fleetd-fire", "-t", &seat_dir, "-p"])
+                .output()?;
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            let cap = std::process::Command::new("tmux")
+                .args(["capture-pane", "-p", "-S", "-30", "-t", &seat_dir])
+                .output()?;
+            let body = String::from_utf8_lossy(&cap.stdout);
+            let delivered = body.contains(&task);
+            let _ = std::process::Command::new("tmux")
+                .args(["send-keys", "-t", &seat_dir, "Enter"])
+                .output()?;
+            ledger::record_dispatch(&c, &seat_dir, &task, None)?;
+            println!("{seat_dir} | {}", if delivered { "DELIVERED" } else { "PASTED (verify fold)" });
+        }
+        Some("dispatch-file") => {
             let task_file = args
                 .get(2)
-                .context("usage: fleetd dispatch <task.md> <repo>")?;
+                .context("usage: fleetd dispatch-file <task.md> <repo>")?;
             let repo = args
                 .get(3)
-                .context("usage: fleetd dispatch <task.md> <repo>")?;
+                .context("usage: fleetd dispatch-file <task.md> <repo>")?;
             // --headless: new structured channel (2026-11-27). Spawns one
             // `claude -p` process on the picked host, streams JSONL events to
             // /tmp/fleetd-runs/<id>/, outcome read from the event file.
@@ -735,11 +906,11 @@ fn main() -> Result<()> {
                     let seat = args.get(3).context("usage: fleetd relay queue <seat> <task.md> <repo>")?;
                     let task_file = args.get(4).context("usage: fleetd relay queue <seat> <task.md> <repo>")?;
                     let repo = args.get(5).context("usage: fleetd relay queue <seat> <task.md> <repo>")?;
-                    let id = fleetd_relay::forward::queue_pull(seat, task_file, repo)?;
+                    let id = relay::forward::queue_pull(seat, task_file, repo)?;
                     println!("queued pull id={id} seat={seat} (delivered on next heartbeat)");
                 }
                 Some("alive") => {
-                    for (seat, ts) in fleetd_relay::relay::alive_since(15)? {
+                    for (seat, ts) in relay::relay::alive_since(15)? {
                         println!("{seat} last-heartbeat {ts}s-epoch");
                     }
                 }
@@ -944,7 +1115,7 @@ fn main() -> Result<()> {
             run_serve_cli(&args)?;
         }
         _ => {
-            println!("fleetd: status | hosts | cleanup | dispatch <task.md> <repo> | event <seat> | serve");
+            println!("fleetd: dispatch <自然语言任务> | status | hosts | cleanup | dispatch-file <task.md> <repo> | event <seat> | blocked | seat ... | serve");
             status(cfg.as_ref().context("config required")?)?;
         }
     }
@@ -962,9 +1133,9 @@ fn run_serve_cli(args: &[String]) -> Result<()> {
         .unwrap_or(3790u16);
     if !args.iter().any(|a| a == "--no-scheduler") {
         std::thread::spawn(|| {
-            fleetd_scheduler::scheduler::serve(|| {
-                let c = fleetd_core::ledger::open()?;
-                fleetd_scheduler::jobs::tick(&c)
+            sched::serve(|| {
+                let c = store::ledger::open()?;
+                scheduler::jobs::tick(&c)
             });
         });
     }
@@ -975,7 +1146,7 @@ fn run_serve_cli(args: &[String]) -> Result<()> {
         let bind = if args.iter().any(|a| a == "--public") { "0.0.0.0" } else { "127.0.0.1" };
         events::serve_on(bind, port)?;
     } else {
-        events::serve_on_unix(&fleetd_scheduler::events::flagship_socket_path())?;
+        events::serve_on_unix(&scheduler::events::flagship_socket_path())?;
     }
     Ok(())
 }

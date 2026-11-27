@@ -1,12 +1,17 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/fleetd-core",
-    "crates/fleetd-relay",
-    "crates/fleetd-scheduler",
-    "crates/fleetd-mcp",
-    "crates/fleetd-agent",
-    "crates/fleetd-tray",
+    "crates/core",
+    "crates/store",
+    "crates/probe",
+    "crates/register",
+    "crates/relay",
+    "crates/scheduler",
+    "crates/report",
+    "crates/service",
+    "crates/mcp",
+    "crates/agent",
+    "crates/tray",
     ".",
 ]
 
@@ -37,11 +42,17 @@ name = "fleetd"
 path = "src/main.rs"
 
 [dependencies]
-fleetd-core = { path = "crates/fleetd-core" }
-fleetd-relay = { path = "crates/fleetd-relay" }
-fleetd-scheduler = { path = "crates/fleetd-scheduler" }
-fleetd-mcp = { path = "crates/fleetd-mcp" }
-fleetd-agent = { path = "crates/fleetd-agent" }
+fleetd-core = { path = "crates/core" }
+store = { path = "crates/store" }
+probe = { path = "crates/probe" }
+register = { path = "crates/register" }
+relay = { path = "crates/relay" }
+scheduler = { path = "crates/scheduler" }
+report = { path = "crates/report" }
+service = { path = "crates/service" }
+mcp = { path = "crates/mcp" }
+agent = { path = "crates/agent" }
+tray = { path = "crates/tray" }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

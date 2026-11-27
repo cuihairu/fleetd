@@ -1,0 +1,12 @@
+[package]
+name = "service"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "fleetd service lifecycle: systemd/launchd/SCM registration + handshake"
+
+[dependencies]
+anyhow.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8"

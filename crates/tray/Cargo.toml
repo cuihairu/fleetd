@@ -1,0 +1,19 @@
+[package]
+name = "tray"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "fleetd tray: standalone windows tray indicator (no python, no DLL closure)"
+
+[lib]
+name = "fleetd_tray_lib"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tray"
+path = "src/main.rs"
+
+[dependencies]
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_System_LibraryLoader", "Win32_Graphics_Gdi", "Win32_Networking_WinSock"] }

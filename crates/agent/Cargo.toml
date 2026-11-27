@@ -1,0 +1,17 @@
+[package]
+name = "agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "fleetd agent face: heartbeat pull loop and executor (runs on every ship, including the flagship host itself)"
+
+[dependencies]
+store = { path = "../store" }
+fleetd-core = { path = "../core" }
+relay = { path = "../relay" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+toml.workspace = true
+dirs.workspace = true

@@ -1,0 +1,13 @@
+[package]
+name = "probe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "fleetd fact collection: hosts, tools, devices"
+
+[dependencies]
+rusqlite.workspace = true
+store = { path = "../store" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true

@@ -1,0 +1,12 @@
+[package]
+name = "register"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "fleetd register: node registry (agent_seen liveness, pull counters) — pure API, no protocol"
+
+[dependencies]
+fleetd-core = { path = "../core" }
+store = { path = "../store" }
+anyhow.workspace = true
+rusqlite.workspace = true
