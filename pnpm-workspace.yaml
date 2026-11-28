@@ -1,0 +1,6 @@
+# pnpm v12+: overrides live here, not in package.json
+overrides:
+  vite: ^6.3.6
+  esbuild: ^0.25.12
+onlyBuiltDependencies:
+  - esbuild
