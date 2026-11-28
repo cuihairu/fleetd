@@ -1045,23 +1045,80 @@ fn main() -> Result<()> {
             resources::init(&c).context("init resources table")?;
             match args.get(2).map(String::as_str) {
                 Some("probe") => {
-                    // fleetd resources probe [host...] — default: config hosts
+                    // fleetd resources probe [host...] — default sweep: the
+                    // resource registry (local/work-runner/openclaw/imac +
+                    // shanghai-pve). OS routing: registry hosts carry their
+                    // syntax (Windows boxes go through the PowerShell file
+                    // channel); config hosts fall back to their os field.
                     let hosts: Vec<String> = match args.get(3) {
                         Some(_) => args[3..].to_vec(),
-                        None => cfg.as_ref().context("config required")?.hosts.iter().map(|h| h.name.clone()).collect(),
+                        None => probe::registry_hosts(),
                     };
                     for h in &hosts {
-                        let (t, d) = probe::probe_all(&c, h)?;
+                        if h == probe::PVE_HOST {
+                            let (state, detail) = probe::probe_pve(&c, h)?;
+                            println!("{h}: vm:pve={detail} [{}]", state.as_str());
+                            continue;
+                        }
+                        let os = probe::FLEET_HOSTS
+                            .iter()
+                            .find(|(n, _)| n == h)
+                            .map(|(_, os)| *os)
+                            .or_else(|| {
+                                cfg.as_ref()?.hosts.iter()
+                                    .find(|x| &x.name == h)
+                                    .and_then(|x| probe::HostOs::from_config(&x.os))
+                            })
+                            .unwrap_or(probe::HostOs::Linux);
+                        let (t, d) = probe::probe_all(&c, h, os)?;
                         println!("{h}: tools={t} devices={d}");
                     }
                 }
                 Some("list") => {
-                    let kind = args.get(3).and_then(|k| resources::ResourceKind::from_str(k));
-                    let host = args.get(4).map(String::as_str);
+                    // fleetd resources list [kind] [host] — or `list <host>`
+                    // for all kinds of one host.
+                    let (kind, host) =
+                        match args.get(3).and_then(|k| resources::ResourceKind::from_str(k)) {
+                            Some(k) => (Some(k), args.get(4).map(String::as_str)),
+                            None => (None, args.get(3).map(String::as_str)),
+                        };
                     let rows = resources::query(&c, kind, host)?;
                     println!("{:<10} {:<12} {:<22} {:<10} {:<8} {}", "kind", "host", "name", "state", "holder", "detail");
                     for r in rows {
                         println!("{:<10} {:<12} {:<22} {:<10} {:<8} {}", r.kind, r.host, r.name, r.state, r.holder, r.detail);
+                    }
+                }
+                Some("query") => {
+                    // fleetd resources query <host> <name> — exact fact lookup
+                    let host = args.get(3).context("usage: fleetd resources query <host> <name>")?;
+                    let name = args.get(4).context("usage: fleetd resources query <host> <name>")?;
+                    let rows = resources::query(&c, None, Some(host))?;
+                    match rows.iter().find(|r| r.name.as_str() == name.as_str()) {
+                        Some(r) => println!(
+                            "{} {host}/{name} state={} holder={} detail={}",
+                            r.kind, r.state, r.holder, r.detail
+                        ),
+                        None => anyhow::bail!("{host}/{name}: not found (run `fleetd resources probe {host}` first?)"),
+                    }
+                }
+                Some("summary") => {
+                    // fleetd resources summary — one line per host
+                    // (FLEETD-RES-002): tools=N docker=online(29.7.2)
+                    // carrier=native-linux vm:pve=2vm+2lxc
+                    let rows = resources::query(&c, None, None)?;
+                    if rows.is_empty() {
+                        println!("(no resources recorded — run `fleetd resources probe`)");
+                    }
+                    for s in resources::summarize(&rows) {
+                        println!(
+                            "{}: tools={} docker={} podman={} carrier={} vm:pve={}",
+                            s.host,
+                            s.tools,
+                            s.docker.as_deref().unwrap_or("-"),
+                            s.podman.as_deref().unwrap_or("-"),
+                            s.carrier.as_deref().unwrap_or("-"),
+                            s.vm.as_deref().unwrap_or("-")
+                        );
                     }
                 }
                 Some("claim") => {
@@ -1077,7 +1134,7 @@ fn main() -> Result<()> {
                     let ok = resources::release_device(&c, host, dev)?;
                     println!("{host}/{dev}: {}", if ok { "released" } else { "not found" });
                 }
-                _ => println!("fleetd resources: probe [host...] | list [kind] [host] | claim <host> <device> <holder> | release <host> <device>"),
+                _ => println!("fleetd resources: probe [host...] | list [kind|host] [host] | query <host> <name> | summary | claim <host> <device> <holder> | release <host> <device>"),
             }
         }
         // --- MCP server for coding agents (stdio) ---

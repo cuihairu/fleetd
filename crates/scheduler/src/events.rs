@@ -141,6 +141,42 @@ fn query_param(request_line: &str, key: &str) -> Option<String> {
     })
 }
 
+/// /v1/resources body (FLEETD-RES-002): per-host summary cells plus the raw
+/// rows backing them — the same data the CLI `resources summary/list` reads
+/// (store::resources::summarize is the single rendering source).
+fn resources_json(c: &rusqlite::Connection) -> Result<String> {
+    store::resources::init(c)?;
+    let rows = store::resources::query(c, None, None)?;
+    let hosts: Vec<serde_json::Value> = store::resources::summarize(&rows)
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "host": s.host,
+                "tools": s.tools,
+                "docker": s.docker,
+                "podman": s.podman,
+                "carrier": s.carrier,
+                "vm": s.vm,
+            })
+        })
+        .collect();
+    let row_json: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "kind": r.kind,
+                "host": r.host,
+                "name": r.name,
+                "detail": r.detail,
+                "state": r.state,
+                "holder": r.holder,
+                "updated_at": r.updated_at,
+            })
+        })
+        .collect();
+    Ok(serde_json::json!({ "hosts": hosts, "rows": row_json }).to_string())
+}
+
 /// 泛化到 Read+Write:HTTP 解析只做读写,UnixListener/插座面同链路复用
 /// (2026-11-27 UNIX socket 默认面拆分)。
 pub fn handle_stream<S: Read + Write + PeerAddr>(
@@ -268,6 +304,22 @@ pub fn handle_stream<S: Read + Write + PeerAddr>(
                         200,
                         "[]".to_string(), // no live pool in this process
                     ),
+                }
+            }
+        }
+        // Resource facts face (FLEETD-RES-002): the probe results behind the
+        // CLI `resources summary/list`, as JSON. Loopback gate like the other
+        // local faces — the data names internal hosts and ssh aliases.
+        Some("GET") if request_line.contains("/v1/resources") => {
+            if !loopback_peer(stream) {
+                (403, r#"{"error":"loopback only"}"#.to_string())
+            } else {
+                match store::ledger::open() {
+                    Err(e) => (500, format!(r#"{{"error":"{}"}}"#, e)),
+                    Ok(c) => match resources_json(&c) {
+                        Ok(j) => (200, j),
+                        Err(e) => (500, format!(r#"{{"error":"{}"}}"#, e)),
+                    },
                 }
             }
         }

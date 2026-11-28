@@ -21,6 +21,10 @@ pub enum ResourceKind {
     /// A verifiable device attached to a host (adb phone, emulator, windows
     /// box used for UI validation) with an occupancy state.
     Device,
+    /// A virtualization endpoint tracked as one row (kind=vm,name=pve):
+    /// the PVE node with its VM/LXC counts. vm:pve is the only VM provider
+    /// (user decision 2026-11-28: vagrant/openstack rejected).
+    Vm,
 }
 
 impl ResourceKind {
@@ -29,6 +33,7 @@ impl ResourceKind {
             ResourceKind::Host => "host",
             ResourceKind::Tool => "tool",
             ResourceKind::Device => "device",
+            ResourceKind::Vm => "vm",
         }
     }
     pub fn from_str(s: &str) -> Option<ResourceKind> {
@@ -36,6 +41,7 @@ impl ResourceKind {
             "host" => Some(ResourceKind::Host),
             "tool" => Some(ResourceKind::Tool),
             "device" => Some(ResourceKind::Device),
+            "vm" => Some(ResourceKind::Vm),
             _ => None,
         }
     }
@@ -187,6 +193,92 @@ pub fn release_device(c: &Connection, host: &str, name: &str) -> Result<bool, ru
     Ok(n > 0)
 }
 
+/// One host's fact line, assembled from resource rows. This struct is the
+/// single rendering source for all three query outlets (CLI `resources
+/// summary`, HTTP `/v1/resources`, MCP `ops.host-facts`) — FLEETD-RES-002:
+/// same data, same source, no outlet-specific re-derivation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HostSummary {
+    pub host: String,
+    /// Installed tools found (daemon/carrier metadata rows excluded).
+    pub tools: usize,
+    /// Container daemon cell, e.g. "online(29.7.2)" or "offline".
+    pub docker: Option<String>,
+    pub podman: Option<String>,
+    /// Carrier classification: "native-linux" | "wsl2" | "docker-desktop".
+    pub carrier: Option<String>,
+    /// PVE fleet size, e.g. "2vm+2lxc".
+    pub vm: Option<String>,
+}
+
+/// Parse a vm-row detail ("vm2/lxc2 (pve-manager/8.4.14)") into (vm, lxc)
+/// counts. Non-numeric or "?" counts → None (the summary then omits the
+/// cell instead of inventing a zero).
+pub fn parse_vm_counts(detail: &str) -> Option<(usize, usize)> {
+    let rest = detail.strip_prefix("vm")?;
+    let slash = rest.find('/')?;
+    let v: usize = rest[..slash].parse().ok()?;
+    let l: usize = rest[slash + 1..]
+        .strip_prefix("lxc")?
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .parse()
+        .ok()?;
+    Some((v, l))
+}
+
+/// Daemon cell for the summary line: "online(<server version>)" when the
+/// daemon answered, bare state otherwise.
+fn daemon_cell(name: &str, rows: &[&ResourceRow]) -> Option<String> {
+    rows.iter().find(|r| r.kind == "tool" && r.name == name).map(|r| {
+        if r.state == "online" && !r.detail.is_empty() && r.detail != "daemon unreachable" {
+            format!("online({})", r.detail)
+        } else {
+            r.state.clone()
+        }
+    })
+}
+
+/// Group resource rows into per-host fact lines, one per host present in
+/// the rows (hosts never probed simply don't appear).
+pub fn summarize(rows: &[ResourceRow]) -> Vec<HostSummary> {
+    let mut hosts: Vec<String> = rows.iter().map(|r| r.host.clone()).collect();
+    hosts.sort();
+    hosts.dedup();
+    let mut out = Vec::new();
+    for host in hosts {
+        let hr: Vec<&ResourceRow> = rows.iter().filter(|r| r.host == host).collect();
+        let tools = hr
+            .iter()
+            .filter(|r| r.kind == "tool" && !r.name.ends_with("-daemon") && r.name != "carrier")
+            .count();
+        let vm = hr
+            .iter()
+            .find(|r| r.kind == "vm")
+            .and_then(|r| parse_vm_counts(&r.detail))
+            .map(|(v, l)| format!("{v}vm+{l}lxc"));
+        out.push(HostSummary {
+            host,
+            tools,
+            docker: daemon_cell("docker-daemon", &hr),
+            podman: daemon_cell("podman-daemon", &hr),
+            carrier: hr
+                .iter()
+                .find(|r| r.kind == "tool" && r.name == "carrier")
+                .map(|r| {
+                    r.detail
+                        .split(" (")
+                        .next()
+                        .unwrap_or("")
+                        .to_string()
+                }),
+            vm,
+        });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,5 +411,35 @@ mod tests {
         assert_eq!(ResourceKind::from_str("bogus"), None);
         assert_eq!(DeviceState::from_str("busy"), Some(DeviceState::Busy));
         assert_eq!(DeviceState::from_str("x"), None);
+        assert_eq!(ResourceKind::from_str("vm"), Some(ResourceKind::Vm));
+        assert_eq!(ResourceKind::Vm.as_str(), "vm");
+    }
+
+    #[test]
+    fn summarize_renders_one_line_facts() {
+        let c = mem();
+        upsert(&c, ResourceKind::Host, "work-runner", "work-runner", "cpus=4 mem=8G", DeviceState::Online, "").unwrap();
+        upsert(&c, ResourceKind::Tool, "work-runner", "cargo", "cargo 1.88", DeviceState::Online, "").unwrap();
+        upsert(&c, ResourceKind::Tool, "work-runner", "docker", "docker 29.7.2", DeviceState::Online, "").unwrap();
+        upsert(&c, ResourceKind::Tool, "work-runner", "docker-daemon", "29.7.2", DeviceState::Online, "").unwrap();
+        upsert(&c, ResourceKind::Tool, "work-runner", "carrier", "native-linux (Debian GNU/Linux 13)", DeviceState::Online, "").unwrap();
+        upsert(&c, ResourceKind::Tool, "work-runner", "docker-daemon", "daemon unreachable", DeviceState::Offline, "").unwrap();
+        // ^ overwrite with offline: last write wins, cell must drop the version
+        upsert(&c, ResourceKind::Vm, "shanghai-pve", "pve", "vm2/lxc2 (pve-manager/8.4.14)", DeviceState::Online, "").unwrap();
+        let rows = query(&c, None, None).unwrap();
+        let s = summarize(&rows);
+        assert_eq!(s.len(), 2);
+        let wr = s.iter().find(|x| x.host == "work-runner").unwrap();
+        assert_eq!(wr.tools, 2, "daemon+carrier rows are metadata, not tools");
+        assert_eq!(wr.docker, Some("offline".into()));
+        assert_eq!(wr.carrier, Some("native-linux".into()));
+        assert_eq!(wr.vm, None);
+        let pve = s.iter().find(|x| x.host == "shanghai-pve").unwrap();
+        assert_eq!(pve.vm, Some("2vm+2lxc".into()));
+        assert_eq!(pve.tools, 0);
+        // and the parse face behind that cell round-trips the detail form
+        assert_eq!(parse_vm_counts("vm2/lxc2 (pve-manager/8.4.14)"), Some((2, 2)));
+        assert_eq!(parse_vm_counts("vm?/lxc2"), None);
+        assert_eq!(parse_vm_counts("unreachable"), None);
     }
 }

@@ -80,6 +80,12 @@ pub struct ReviewDecideQuery {
     pub reason: Option<String>,
 }
 
+#[derive(Deserialize, serde::Serialize, rmcp::schemars::JsonSchema)]
+pub struct HostFactsQuery {
+    /// Host name (ssh alias or 'local'), e.g. "work-runner", "openclaw", "shanghai-pve".
+    pub host: String,
+}
+
 impl FleetMcp {
     pub fn new() -> Self {
         Self {
@@ -128,6 +134,67 @@ impl FleetMcp {
         }
         if out.is_empty() {
             out.push_str("(no dispatch activity in the last day)\n");
+        }
+        out
+    }
+
+    /// One host's full fact sheet from the resources ledger (FLEETD-RES-002).
+    /// This is the sanctioned way to answer machine-capability questions:
+    /// query here first, escalate to `fleetd resources probe` when stale —
+    /// direct ssh hand-probing is banned (the criticism this tool root-fixes).
+    #[tool(
+        name = "ops.host-facts",
+        description = "One host's full fact sheet: reachability, installed tools, container daemon states (docker/podman online + server version), host carrier (native-linux/wsl2/docker-desktop), PVE capacity (vm/lxc counts). Read-only; if the answer looks stale, run `fleetd resources probe [host]` first."
+    )]
+    pub async fn ops_host_facts(&self, Parameters(query): Parameters<HostFactsQuery>) -> String {
+        let c = match store::ledger::open() {
+            Ok(c) => c,
+            Err(e) => return format!("ledger error: {e}"),
+        };
+        if let Err(e) = store::resources::init(&c) {
+            return format!("resources init error: {e}");
+        }
+        let rows = match store::resources::query(&c, None, Some(&query.host)) {
+            Ok(r) => r,
+            Err(e) => return format!("resources query error: {e}"),
+        };
+        if rows.is_empty() {
+            return format!(
+                "{}: no facts recorded (run `fleetd resources probe {}` first)",
+                query.host, query.host
+            );
+        }
+        let mut out = format!("host: {}\n", query.host);
+        if let Some(h) = rows.iter().find(|r| r.kind == "host") {
+            out.push_str(&format!("state: {} ({})\n", h.state, h.detail));
+        }
+        let tools: Vec<String> = rows
+            .iter()
+            .filter(|r| r.kind == "tool" && !r.name.ends_with("-daemon") && r.name != "carrier")
+            .map(|r| format!("{} ({})", r.name, r.detail))
+            .collect();
+        out.push_str(&format!("tools({}): {}\n", tools.len(), tools.join(", ")));
+        for r in rows.iter().filter(|r| r.name.ends_with("-daemon")) {
+            out.push_str(&format!(
+                "daemon {} {}: {}\n",
+                r.name.trim_end_matches("-daemon"),
+                r.state,
+                r.detail
+            ));
+        }
+        if let Some(car) = rows.iter().find(|r| r.name == "carrier") {
+            out.push_str(&format!("carrier: {}\n", car.detail));
+        }
+        for r in rows.iter().filter(|r| r.kind == "vm") {
+            out.push_str(&format!("vm {} {}: {}\n", r.name, r.state, r.detail));
+        }
+        for r in rows.iter().filter(|r| r.kind == "device") {
+            let held = if r.holder.is_empty() {
+                String::new()
+            } else {
+                format!(" (held by {})", r.holder)
+            };
+            out.push_str(&format!("device {} {}: {}{}\n", r.name, r.state, r.detail, held));
         }
         out
     }
