@@ -329,11 +329,21 @@ pub fn update_remote_windows(host: &str, restart: bool) -> Result<(String, Strin
     // refuses to Move over an existing file ("cannot rename because the file
     // already exists", observed live 2026-11-28 — the service bounced but
     // the old exe stayed). Overwrite-copy then drop the temp file.
+    // After Stop-Service, drain-wait up to 8 s for the exe to unlock: a
+    // stray serve started outside the service (observed live: PID from the
+    // previous day) keeps fleetd.exe locked and Stop-Service never touches
+    // it — bounded wait, then a hard kill so the swap always proceeds.
     let ps = format!(
         "$ErrorActionPreference='Stop'; \
          $d='C:/Users/cui/.fleetd'; \
          $t = Measure-Command {{ \
              Stop-Service FleetD -Force; \
+             $deadline = (Get-Date).AddSeconds(8); \
+             while ((Get-Date) -lt $deadline -and \
+                    (Get-Process fleetd -ErrorAction SilentlyContinue)) {{ \
+                 Start-Sleep -Milliseconds 200 }}; \
+             if (Get-Process fleetd -ErrorAction SilentlyContinue) {{ \
+                 Stop-Process -Name fleetd -Force -ErrorAction SilentlyContinue }}; \
              Copy-Item \"$d/fleetd.exe\" \"$d/fleetd.exe.bak\" -Force; \
              Copy-Item \"$d/fleetd.new.exe\" \"$d/fleetd.exe\" -Force; \
              Remove-Item \"$d/fleetd.new.exe\" -Force; \
@@ -362,7 +372,7 @@ pub fn update_remote_windows(host: &str, restart: bool) -> Result<(String, Strin
     .with_context(|| format!("scp update script to {host}"))?;
     let out = sh(&format!(
         "ssh -o BatchMode=yes {host} \
-         \"powershell -NoProfile -Command '& C:/Users/cui/.fleetd/update.ps1'\""
+         \"powershell -NoProfile -Command \\\"& 'C:/Users/cui/.fleetd/update.ps1'\\\"\""
     ))
     .with_context(|| format!("windows swap on {host}"))?;
     println!("{out}"); // stop_window_ms=... + service status — the evidence
