@@ -80,3 +80,36 @@ workspaces 构建产物。DESIGN.md §3.4 FileFs/§3.5 三铁律（只删自己�
 
 ## 关联队列
 `~/.hermes/cache/scratch/tasks/QUEUE-2026-11-28.md`（5 单滚动状态）。
+
+## D5. tmux 库生态调研与集成决策（2026-11-28 用户令「集成 libtmux」「测试验证 tmux-mcp」）🟡
+
+**调研结论**（生态盘点）：
+| 库 | 语言 | 形态 | 版本要求 | 评估 |
+|---|---|---|---|---|
+| libtmux（Rust，libtmux-rs） | Rust | 异步 typed 对象模型+ControlMode+subscribe | Rust 1.85+，tmux >= 3.3a（基础）；control-mode 需 daemon >= 3.7 | **选用**（pin =0.1.2，API 未稳） |
+| tmux_interface | Rust | 同步命令 builder | 老 | 备选，无 control mode |
+| libtmux（Python） | Python | ORM 式对象模型，tmuxp 同门 | tmux >= 3.2a | pyhost 侧可选 |
+| tmux-mcp（fr1sk/nickgnd 等） | MCP | agent 直控 tmux | node | **已实测，见下** |
+
+**版本硬事实（本机）**：tmux 3.6a（ubuntu 26.04 源顶）→ libtmux Rust 基础对象模型可用，
+**control-mode/subscribe/pane-stream 不可用**（需 daemon ≥ 3.7 final）。升级路径=源码编译
+tmux 3.7+ 至 /usr/local/bin（与系统 3.6a 并存），暂不做——control-mode 等有真实流需求再升。
+
+**集成策略**（避免大翻面）：libtmux 进 fleetd-core 依赖，新代码（presence 对账 pane 查询等）
+用 typed API；现有 tmux_run 14 处调用点不翻，新旧并存渐进迁移。
+
+**tmux-mcp 实测（2026-11-28 编排方验证，fr1sk/tmux-mcp）**：
+- 依赖干净（仅 @modelcontextprotocol/sdk + zod），npm install+build 通过
+- stdio JSON-RPC 握手 ok；tools/list 14 个工具：list_sessions/windows/panes、capture_pane、
+  send_keys、new_session/window、split_pane、kill_*、rename_*、get_config
+- 实调 list_sessions（返回全部席位 JSON）与 capture_pane（读 fleetd 席实时屏）均正确
+- 评估：**能力面=席位管理的只读+操作基本盘，缺 hook/presence 集成**。对 fleetd 的价值=
+  参考其工具面设计（fleetd MCP 补 seat_capture/seat_send 时对齐）；或作为 Hermes 侧独立
+  通道（不经 fleetd 直控 tmux 的旁路，调试用）。不建议直接上生产主力通道。
+
+## D6. 席位环境类型登记（2026-11-28 用户令）⏳→FLEETD-EXECUTOR-001
+
+用户令原文：「席位记录的时候需要记录环境类型 是tmux 还是docker 还有native 还是各种vm」。
+落点：seats 表加 `executor` 列（枚举 tmux/container/native/vm，默认 tmux），dispatch 路由
+按 executor 分派（container/vm/native 先占位明确报错，容器试点单来填），/v1/fleet 输出加
+executor 列。与 libtmux 集成合并为 FLEETD-EXECUTOR-001（队列 #7）。
