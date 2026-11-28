@@ -232,6 +232,8 @@ pub fn handle_stream<S: Read + Write + PeerAddr>(
         // the seat's fleet-memory count, so dashboards read it in one trip.
         // `executor` (FLEETD-EXECUTOR-001) = the seat's registered
         // environment (tmux/container/native/vm; tmux when unregistered).
+        // `review` (FLEETD-GATE-001) = the seat's dispatches awaiting an
+        // adversarial review pass — the gate backlog, board-visible.
         Some("GET")
             if request_line.contains("/v1/fleet")
                 && !request_line.contains("/v1/fleet/summary") =>
@@ -245,10 +247,16 @@ pub fn handle_stream<S: Read + Write + PeerAddr>(
                     let counts: std::collections::HashMap<String, i64> =
                         store::ledger::memory_seat_counts(&c)?.into_iter().collect();
                     let executors = store::ledger::executor_map(&c)?;
-                    Ok((rows, counts, executors))
+                    // FLEETD-GATE-001: the adversarial-review backlog per
+                    // seat — dashboards show work awaiting a checker.
+                    let review: std::collections::HashMap<String, i64> =
+                        store::ledger::review_counts_by_seat(&c)?
+                            .into_iter()
+                            .collect();
+                    Ok((rows, counts, executors, review))
                 });
                 match face {
-                    Ok((rows, counts, executors)) => {
+                    Ok((rows, counts, executors, review)) => {
                         let arr: Vec<serde_json::Value> = rows
                             .iter()
                             .map(|r| {
@@ -264,6 +272,7 @@ pub fn handle_stream<S: Read + Write + PeerAddr>(
                                     "last_event_ts": r.last_event_ts,
                                     "last_commit": r.last_commit,
                                     "notes": counts.get(&r.seat).copied().unwrap_or(0),
+                                    "review": review.get(&r.seat).copied().unwrap_or(0),
                                 })
                             })
                             .collect();

@@ -59,6 +59,27 @@ pub struct MemoryQuery {
     pub limit: Option<u32>,
 }
 
+#[derive(Deserialize, serde::Serialize, rmcp::schemars::JsonSchema)]
+pub struct ReviewListQuery {
+    /// Filter by seat; omit to list the whole fleet's review backlog.
+    #[serde(default)]
+    pub seat: Option<String>,
+}
+
+#[derive(Deserialize, serde::Serialize, rmcp::schemars::JsonSchema)]
+pub struct ReviewDecideQuery {
+    /// Dispatch id, as reported by fleet_review_list.
+    pub id: i64,
+    /// true = pass the gate (dispatch lands done); false = bounce it back to the seat.
+    pub pass: bool,
+    /// Evidence path when passing (command output / screenshot / test log). REQUIRED on pass — no evidence, no done.
+    #[serde(default)]
+    pub evidence: Option<String>,
+    /// What failed and why, when failing. REQUIRED on fail.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
 impl FleetMcp {
     pub fn new() -> Self {
         Self {
@@ -81,7 +102,7 @@ impl FleetMcp {
     /// Seat dispatch status: recent (1d) fired/done/inflight/stalled/partial counts.
     #[tool(
         name = "seat_status",
-        description = "Fleet seat status: recent dispatch counts and outcomes for a seat (omit name for all). Read-only."
+        description = "Fleet seat status: recent dispatch counts and outcomes for a seat (omit name for all). Counts include the adversarial-review backlog (review/review_failed). Read-only."
     )]
     pub async fn seat_status(&self, Parameters(query): Parameters<SeatQuery>) -> String {
         let c = match store::ledger::open() {
@@ -100,14 +121,110 @@ impl FleetMcp {
                 }
             }
             out.push_str(&format!(
-                "{} fired={} done={} inflight={} stalled={} partial={}\n",
-                r.seat, r.fired, r.completed, r.inflight, r.stalled, r.partial
+                "{} fired={} done={} inflight={} stalled={} partial={} review={} review_failed={}\n",
+                r.seat, r.fired, r.completed, r.inflight, r.stalled, r.partial, r.review,
+                r.review_failed
             ));
         }
         if out.is_empty() {
             out.push_str("(no dispatch activity in the last day)\n");
         }
         out
+    }
+
+    /// Adversarial-review backlog (FLEETD-GATE-001): dispatches whose seat
+    /// reported completion but which await a checker's pass/fail decision.
+    #[tool(
+        name = "fleet_review_list",
+        description = "List dispatches awaiting adversarial review (state review/review_failed): seat, task, baseline→head, rejections, evidence. Decided via fleet_review_decide. Read-only."
+    )]
+    pub async fn fleet_review_list(
+        &self,
+        Parameters(query): Parameters<ReviewListQuery>,
+    ) -> String {
+        let c = match store::ledger::open() {
+            Ok(c) => c,
+            Err(e) => return format!("ledger error: {e}"),
+        };
+        // Stale watchdog: reviews waiting >24h raise one review_stale event
+        // each so the board sees overdue checks (never auto-passes).
+        let _ = store::ledger::review_stale_alerts(&c);
+        let rows = match store::ledger::review_list(&c) {
+            Ok(r) => r,
+            Err(e) => return format!("review list error: {e}"),
+        };
+        let arr: Vec<serde_json::Value> = rows
+            .iter()
+            .filter(|r| query.seat.as_deref().map(|s| r.seat == s).unwrap_or(true))
+            .map(|r| {
+                serde_json::json!({
+                    "id": r.id,
+                    "seat": r.seat,
+                    "tag": r.tag,
+                    "state": r.state,
+                    "acceptance": r.acceptance,
+                    "baseline_head": r.baseline_head,
+                    "head_at_finish": r.head_at_finish,
+                    "fired_at": r.fired_at,
+                    "finished_at": r.finished_at,
+                    "reject_count": r.reject_count,
+                    "review_note": r.review_note,
+                    "evidence_path": r.evidence_path,
+                })
+            })
+            .collect();
+        serde_json::to_string(&arr).unwrap_or_else(|e| format!("serialize error: {e}"))
+    }
+
+    /// Decide a review (FLEETD-GATE-001): pass lands the dispatch as done
+    /// WITH evidence (mandatory — no evidence, no done); fail bounces it
+    /// back to the seat with a recorded reason (>=2 rejections escalate).
+    #[tool(
+        name = "fleet_review_decide",
+        description = "Decide an adversarial review: pass=true requires evidence path (no evidence, no done); pass=false requires reason (dispatch bounces back to the seat, >=2 rejections escalate to the orchestrator)."
+    )]
+    pub async fn fleet_review_decide(
+        &self,
+        Parameters(query): Parameters<ReviewDecideQuery>,
+    ) -> String {
+        let c = match store::ledger::open() {
+            Ok(c) => c,
+            Err(e) => return format!("ledger error: {e}"),
+        };
+        if query.pass {
+            let evidence = query
+                .evidence
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let Some(evidence) = evidence else {
+                return "refused: evidence path required to pass (no evidence, no done)".into();
+            };
+            match store::ledger::review_pass(&c, query.id, evidence) {
+                Ok(()) => format!(
+                    "dispatch {} passed the gate -> done (evidence: {evidence})",
+                    query.id
+                ),
+                Err(e) => format!("refused: {e}"),
+            }
+        } else {
+            let reason = query
+                .reason
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let Some(reason) = reason else {
+                return "refused: reason required to fail a review".into();
+            };
+            match store::ledger::review_fail(&c, query.id, reason) {
+                Ok(true) => format!(
+                    "dispatch {} bounced back to the seat (reason: {reason}); ESCALATED to orchestrator (>=2 rejections)",
+                    query.id
+                ),
+                Ok(false) => format!("dispatch {} bounced back to the seat (reason: {reason})", query.id),
+                Err(e) => format!("refused: {e}"),
+            }
+        }
     }
 
     /// List scheduled jobs with schedule, enabled flag and run counts.

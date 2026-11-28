@@ -69,6 +69,26 @@ fn count_claude(h: &Host) -> Result<usize> {
     }
 }
 
+/// Uncommitted-change count in a seat's workspace repo (the review checker's
+/// ground truth helper). None when the workspace is missing or not a repo —
+/// off-host seats report "-" rather than a fake zero.
+fn seat_dirty_count(seat: &str) -> Option<i64> {
+    let path = Path::new("/home/cui/workspaces").join(seat);
+    let out = Command::new("git")
+        .args(["-C", &path.display().to_string(), "status", "--porcelain"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .count() as i64,
+    )
+}
+
 fn db_path() -> PathBuf {
     dirs::home_dir()
         .expect("home")
@@ -900,13 +920,20 @@ fn main() -> Result<()> {
             if !rows.is_empty() {
                 println!("\n--- 1d dispatch progress (ledger) ---");
                 println!(
-                    "{:<20} {:>6} {:>8} {:>9} {:>8} {:>8}",
-                    "seat", "fired", "done", "inflight", "stall", "partial"
+                    "{:<20} {:>6} {:>8} {:>9} {:>8} {:>8} {:>7} {:>8}",
+                    "seat", "fired", "done", "inflight", "stall", "partial", "review", "bounced"
                 );
                 for r in rows {
                     println!(
-                        "{:<20} {:>6} {:>8} {:>9} {:>8} {:>8}",
-                        r.seat, r.fired, r.completed, r.inflight, r.stalled, r.partial
+                        "{:<20} {:>6} {:>8} {:>9} {:>8} {:>8} {:>7} {:>8}",
+                        r.seat,
+                        r.fired,
+                        r.completed,
+                        r.inflight,
+                        r.stalled,
+                        r.partial,
+                        r.review,
+                        r.review_failed
                     );
                 }
             }
@@ -1479,6 +1506,115 @@ fn main() -> Result<()> {
                 _ => anyhow::bail!("usage: fleetd memory put|get|list|rm"),
             }
         }
+        // --- adversarial review gate (FLEETD-GATE-001, 2026-11-28): a
+        // seat's "done" is only a claim until a checker passes it with
+        // evidence. review list = the checker's queue; pass = land as done
+        // (evidence mandatory); fail = bounce back to the seat with a
+        // recorded reason (>=2 rejections escalate to the orchestrator).
+        Some("review") => {
+            let c = ledger::open()?;
+            let flag = |name: &str| -> Option<String> {
+                args.iter()
+                    .position(|a| a == name)
+                    .and_then(|i| args.get(i + 1))
+                    .cloned()
+                    .filter(|v| !v.is_empty())
+            };
+            match args.get(2).map(String::as_str) {
+                Some("list") => {
+                    // Stale watchdog: reviews waiting >24h raise one
+                    // review_stale event each; never auto-passed.
+                    let stale = ledger::review_stale_alerts(&c)?;
+                    let rows = ledger::review_list(&c)?;
+                    if rows.is_empty() {
+                        println!("no dispatches awaiting review");
+                        return Ok(());
+                    }
+                    println!(
+                        "{:<5} {:<14} {:<14} {:<12} {:>3} {:>7}  {}",
+                        "id", "seat", "state", "acc", "rej", "age", "tag"
+                    );
+                    for r in &rows {
+                        let anchor = r.finished_at.unwrap_or(r.fired_at);
+                        let age_h = (now().saturating_sub(anchor as u64)) / 3600;
+                        let age = format!("{}h", age_h);
+                        let tag_first = r.tag.lines().next().unwrap_or("");
+                        let tag_short: String = tag_first.chars().take(60).collect();
+                        // Workspace truth for the checker: uncommitted changes
+                        // in the seat's repo (best effort, "-" off-host).
+                        let dirty = seat_dirty_count(&r.seat)
+                            .map(|d| d.to_string())
+                            .unwrap_or_else(|| "-".into());
+                        let mut flags = Vec::new();
+                        if stale.contains(&r.id) {
+                            flags.push("STALE>24h");
+                        }
+                        if r.acceptance.as_deref() == Some("user-verify") {
+                            flags.push("USER-VERIFY");
+                        }
+                        if r.reject_count >= 2 {
+                            flags.push("ESCALATED");
+                        }
+                        println!(
+                            "{:<5} {:<14} {:<14} {:<12} {:>3} {:>7}  {}{}",
+                            r.id,
+                            r.seat,
+                            r.state,
+                            r.acceptance.as_deref().unwrap_or("adversarial"),
+                            r.reject_count,
+                            age,
+                            tag_short,
+                            if flags.is_empty() {
+                                format!("  dirty={dirty}")
+                            } else {
+                                format!("  dirty={dirty} [{}]", flags.join(","))
+                            },
+                        );
+                        if let Some(base) = &r.baseline_head {
+                            println!(
+                                "      base {} -> head {}{}",
+                                base,
+                                r.head_at_finish.as_deref().unwrap_or("-"),
+                                r.review_note
+                                    .as_deref()
+                                    .map(|n| format!("  note: {n}"))
+                                    .unwrap_or_default()
+                            );
+                        }
+                    }
+                }
+                Some("pass") => {
+                    let id: i64 = args
+                        .get(3)
+                        .context("usage: fleetd review pass <id> --evidence <path>")?
+                        .parse()
+                        .context("dispatch id must be a number")?;
+                    let evidence = flag("--evidence")
+                        .context("evidence required: review pass without evidence is refused (command output / screenshot / test result path)")?;
+                    ledger::review_pass(&c, id, &evidence)?;
+                    println!("dispatch {id}: done (evidence: {evidence})");
+                }
+                Some("fail") => {
+                    let id: i64 = args
+                        .get(3)
+                        .context("usage: fleetd review fail <id> --reason \"...\"")?
+                        .parse()
+                        .context("dispatch id must be a number")?;
+                    let reason = flag("--reason")
+                        .context("reason required: a rejection must say what failed")?;
+                    let escalated = ledger::review_fail(&c, id, &reason)?;
+                    println!("dispatch {id}: bounced back to the seat (reason recorded)");
+                    if escalated {
+                        println!(
+                            "ESCALATED: {id} rejected >=2 times — orchestrator must intervene"
+                        );
+                    }
+                }
+                _ => {
+                    println!("usage: fleetd review list | review pass <id> --evidence <path> | review fail <id> --reason \"...\"");
+                }
+            }
+        }
         Some("serve") => {
             // Tray is a SEPARATE process now (`fleetd tray`, 2026-11-27 用户令
             // 「tray 和 serve 拆开」): serve never spawns it; the OS service
@@ -1487,7 +1623,7 @@ fn main() -> Result<()> {
             run_serve_cli(&args)?;
         }
         _ => {
-            println!("fleetd: dispatch <自然语言任务> | status | hosts | cleanup | dispatch-file <task.md> <repo> | event <seat> | blocked | seat ... | serve");
+            println!("fleetd: dispatch <自然语言任务> | status | hosts | cleanup | dispatch-file <task.md> <repo> | event <seat> | blocked | seat ... | review list|pass|fail | memory ... | serve");
             status(cfg.as_ref().context("config required")?)?;
         }
     }

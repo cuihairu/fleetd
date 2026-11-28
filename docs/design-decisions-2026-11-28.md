@@ -113,3 +113,32 @@ tmux 3.7+ 至 /usr/local/bin（与系统 3.6a 并存），暂不做——control
 落点：seats 表加 `executor` 列（枚举 tmux/container/native/vm，默认 tmux），dispatch 路由
 按 executor 分派（container/vm/native 先占位明确报错，容器试点单来填），/v1/fleet 输出加
 executor 列。与 libtmux 集成合并为 FLEETD-EXECUTOR-001（队列 #7）。
+
+## D7. 任务状态机加对抗检查闸（2026-11-28 用户令，复盘 7 例「报完成被推翻」）✅
+
+用户令原文：「那么这些是否可以设计到 fleet 中 分配的任务的状态机 完成之前有一次对抗检查」。
+把「对抗检查后才能说完成」从编排方自觉升级为 fleetd 状态机强制闸——席位报 Completed
+不直接落 done，先入 `review` 态，检查方复核效果过闸才 done，不过闸打回并记录原因。
+
+**状态机**：dispatch（记 baseline）→ active → Stop hook 报 Completed →（gate 纯函数）
+→ `review`（对抗检查态）→ review_pass（带证据）→ done；review_fail → `review_failed`
+（打回原因入账，行重开，席位下轮 Stop hook 重新走 verdict）；打回 ≥2 次升级上报编排方。
+非 Completed verdict（Partial/Stalled/NoProgress）不进 review，按既有语义处置。
+
+**验收档位**（TaskSpec.acceptance，任务书里 `acceptance: <mode>` 声明）：
+- `self-check`：纯文档/勾账类，Completed 直接 done；
+- `adversarial`（**默认**，未声明或读不到一律按此）：入 review，编排方或检查席复核；
+- `user-verify`：入 review + 事件链推「待用户亲验」（beacon 岛类任务硬门）。
+
+**落地件**（FLEETD-GATE-001）：
+- core/gate.rs 纯函数 `gate(verdict, &TaskSpec) -> GateDecision`（EnterReview/DirectDone/Reject）；
+- store 迁移：dispatches 加 `state/acceptance/evidence_path/review_note/reject_count` 列
+  （ALTER 容错+存量回填 done），events 加 `note` 列；ingest 在 Completed 处走闸；
+- 检查面：`fleetd review list|pass|fail` CLI + MCP `fleet_review_list`/`fleet_review_decide`；
+- **证据强制**：pass 无 `--evidence` 拒绝（没有证据就没有 done），evidence 落列可审计；
+- 事件链：入 review 落 `review_pending`，打回落 `review_rejected`，升级落 `review_escalated`，
+  滞留 >24h 落一次 `review_stale`（去重）；/v1/fleet 每席位带 `review` 计数，status 面板加
+  review/bounced 列。
+
+**边界**：检查方本单仍是编排方（Hermes）人工/半自动过闸；自动化检查器（跑测试/看截图的
+review 席）是下一单。review 态超时不设自动过闸——宁可积压不可虚过。

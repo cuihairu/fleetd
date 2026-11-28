@@ -8,6 +8,7 @@ pub mod attach;
 pub mod config;
 pub mod dispatcher;
 pub mod executor;
+pub mod gate;
 pub mod presence;
 pub mod schedule;
 pub mod topology;

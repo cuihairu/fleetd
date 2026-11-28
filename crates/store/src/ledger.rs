@@ -137,6 +137,32 @@ pub fn open() -> Result<Connection> {
         let sql = format!("ALTER TABLE seats ADD COLUMN {col};");
         let _ = c.execute_batch(&sql); // duplicate-column errors are fine
     }
+    // Adversarial review gate (FLEETD-GATE-001, 2026-11-28): dispatches gain
+    // a first-class state machine. `state`: active (in flight) → review
+    // (awaiting adversarial check) → done (passed with evidence); review_failed
+    // marks a dispatch the checker rejected and re-opened. Legacy columns keep
+    // their meaning; `acceptance` records the task's verification tier,
+    // `evidence_path` the reviewer's receipt, `review_note` the rejection
+    // reason, `reject_count` how many times the checker bounced it.
+    for col in [
+        "state TEXT NOT NULL DEFAULT 'active'",
+        "acceptance TEXT",
+        "evidence_path TEXT",
+        "review_note TEXT",
+        "reject_count INTEGER NOT NULL DEFAULT 0",
+    ] {
+        let sql = format!("ALTER TABLE dispatches ADD COLUMN {col};");
+        let _ = c.execute_batch(&sql); // duplicate-column errors are fine
+    }
+    // Rejection reasons and gate notifications ride on events; `note` carries
+    // the free-form payload (reason / dispatch reference / mode marker).
+    let _ = c.execute_batch("ALTER TABLE events ADD COLUMN note TEXT;");
+    // Backfill legacy rows: everything already finished is done (the gate
+    // only applies to completions reported after this migration).
+    let _ = c.execute_batch(
+        "UPDATE dispatches SET state='done'
+         WHERE finished_at IS NOT NULL AND finished_at != '' AND state='active';",
+    );
     Ok(c)
 }
 
@@ -252,18 +278,22 @@ fn is_terminal_kind(kind: &str) -> bool {
 /// Ingest the event, classify against the in-flight dispatch, close it out.
 /// Returns the verdict (also stored on the event row). Observational kinds
 /// (notification/compact) are recorded but leave the dispatch open.
+/// A Completed verdict no longer lands as done directly (FLEETD-GATE-001):
+/// the gate function decides between direct-done (self-check tasks) and the
+/// adversarial `review` state where a checker must pass it with evidence.
 pub fn ingest(c: &Connection, ev: &SeatEvent) -> Result<Verdict> {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs();
+        .as_secs() as i64;
     let terminal = is_terminal_kind(&ev.kind);
     // Only classify when the event is terminal AND we have a baseline.
-    let baseline: Option<String> = if terminal {
-        inflight(c, &ev.seat)?.and_then(|(_, _, b)| b)
+    let target: Option<(i64, String, Option<String>)> = if terminal {
+        inflight(c, &ev.seat)?
     } else {
         None
     };
+    let baseline: Option<String> = target.as_ref().and_then(|(_, _, b)| b.clone());
     let verdict = if terminal {
         classify(baseline.as_deref(), ev.head.as_deref(), ev.dirty)
     } else {
@@ -284,17 +314,121 @@ pub fn ingest(c: &Connection, ev: &SeatEvent) -> Result<Verdict> {
     )?;
     // Only terminal events close the in-flight dispatch. Observational kinds
     // (notification/session_start/compact) are recorded but leave it open.
-    if terminal && inflight(c, &ev.seat)?.is_some() {
-        c.execute(
-            "UPDATE dispatches SET finished_at=?1, outcome=?2, head_at_finish=?3,
-             open_at_finish=?4, dirty_at_finish=?5 WHERE seat=?6 AND finished_at IS NULL",
-            rusqlite::params![ts, verdict.as_str(), ev.head, ev.open, ev.dirty, ev.seat],
-        )?;
+    // Closed by id (not by seat-wide WHERE): a re-opened review_failed row
+    // must be the exact row this verdict was classified against.
+    if let Some((id, tag, _)) = target {
+        close_dispatch(c, id, &tag, verdict, ev, ts)?;
     }
     Ok(verdict)
 }
 
-/// Register a dispatch so later events can be classified.
+/// Apply the gate to a terminal verdict against one dispatch row.
+/// Non-Completed verdicts keep the legacy close semantics (finished with
+/// their outcome; state='done' means merely "closed" — progress stats still
+/// split by outcome, so a stalled close never counts as completed work).
+fn close_dispatch(
+    c: &Connection,
+    id: i64,
+    tag: &str,
+    verdict: Verdict,
+    ev: &SeatEvent,
+    ts: i64,
+) -> Result<()> {
+    let decision = if verdict == Verdict::Completed {
+        let spec = task_spec_for_tag(tag);
+        fleetd_core::gate::gate(verdict, &spec)
+    } else {
+        fleetd_core::gate::GateDecision::Reject
+    };
+    match decision {
+        fleetd_core::gate::GateDecision::DirectDone => {
+            c.execute(
+                "UPDATE dispatches SET finished_at=?1, outcome=?2, head_at_finish=?3,
+                 open_at_finish=?4, dirty_at_finish=?5, state='done',
+                 acceptance=?6 WHERE id=?7",
+                rusqlite::params![
+                    ts,
+                    verdict.as_str(),
+                    ev.head,
+                    ev.open,
+                    ev.dirty,
+                    fleetd_core::gate::Acceptance::SelfCheck.as_str(),
+                    id
+                ],
+            )?;
+        }
+        fleetd_core::gate::GateDecision::EnterReview => {
+            let spec = task_spec_for_tag(tag);
+            c.execute(
+                "UPDATE dispatches SET finished_at=?1, outcome=?2, head_at_finish=?3,
+                 open_at_finish=?4, dirty_at_finish=?5, state='review',
+                 acceptance=?6 WHERE id=?7",
+                rusqlite::params![
+                    ts,
+                    verdict.as_str(),
+                    ev.head,
+                    ev.open,
+                    ev.dirty,
+                    spec.acceptance.as_str(),
+                    id
+                ],
+            )?;
+            // Gate notification into the event chain: the orchestrator board
+            // (and review list) picks review_pending up from here.
+            let note = match spec.acceptance {
+                fleetd_core::gate::Acceptance::UserVerify => Some(
+                    "user-verify required: dispatch awaits the user's personal check".to_string(),
+                ),
+                _ => Some(format!("dispatch {id} awaits adversarial review")),
+            };
+            record_event(
+                c,
+                &ev.seat,
+                "review_pending",
+                ev.head.as_deref(),
+                note.as_deref(),
+            )?;
+        }
+        fleetd_core::gate::GateDecision::Reject => {
+            c.execute(
+                "UPDATE dispatches SET finished_at=?1, outcome=?2, head_at_finish=?3,
+                 open_at_finish=?4, dirty_at_finish=?5, state='done' WHERE id=?6",
+                rusqlite::params![ts, verdict.as_str(), ev.head, ev.open, ev.dirty, id],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Resolve the TaskSpec for a dispatch tag. The tag may carry an inline
+/// `acceptance:` declaration (natural-language dispatches paste the whole
+/// task text as the tag), name a task file on disk (seat fire / relay queue
+/// pass full paths), or be a bare task-file name under the hermes scratch
+/// dir. Anything unreadable defaults to adversarial — the safe gate.
+fn task_spec_for_tag(tag: &str) -> fleetd_core::gate::TaskSpec {
+    use fleetd_core::gate::{parse_acceptance, TaskSpec};
+    if let Some(a) = parse_acceptance(tag) {
+        return TaskSpec { acceptance: a };
+    }
+    let candidates = [
+        std::path::PathBuf::from(tag.trim()),
+        PathBuf::from(home_dir())
+            .join(".hermes/cache/scratch/tasks")
+            .join(format!("{}.md", tag.trim())),
+    ];
+    for path in &candidates {
+        if path.is_file() {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                return TaskSpec::from_task_text(&text);
+            }
+        }
+    }
+    TaskSpec::default()
+}
+
+/// Register a dispatch so later events can be classified. The acceptance
+/// tier is resolved from the task text up front so review faces can show
+/// what mode of check the dispatch owes.
 pub fn record_dispatch(
     c: &Connection,
     seat: &str,
@@ -305,14 +439,44 @@ pub fn record_dispatch(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
+    // Baseline capture (FLEETD-GATE-001): verdicts classify the seat's HEAD
+    // against this baseline — without one every stop event reads untracked
+    // and the gate never sees a completion. Callers rarely know the head, so
+    // capture it from the seat workspace (the fleet-wide seat=workspace-dir
+    // convention). Best effort: remote seats without a local checkout stay
+    // None (untracked, the pre-gate behavior).
+    let captured = baseline
+        .map(|b| b.to_string())
+        .or_else(|| capture_seat_head(seat));
     c.execute(
-        "INSERT INTO dispatches(seat,tag,fired_at,baseline_head) VALUES(?1,?2,?3,?4)",
-        rusqlite::params![seat, tag, ts, baseline],
+        "INSERT INTO dispatches(seat,tag,fired_at,baseline_head,acceptance)
+         VALUES(?1,?2,?3,?4,?5)",
+        rusqlite::params![seat, tag, ts, captured, task_spec_for_tag(tag).acceptance.as_str()],
     )?;
     Ok(())
 }
 
+/// Current short HEAD of a seat's workspace repo; None when the dir is
+/// missing or not a repository.
+fn capture_seat_head(seat: &str) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args([
+            "-C",
+            &format!("/home/cui/workspaces/{seat}"),
+            "rev-parse",
+            "--short",
+            "HEAD",
+        ])
+        .output()
+        .ok()?;
+    let head = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !head.is_empty()).then_some(head)
+}
+
 /// Per-seat aggregate counts for `fleetd status` over the last `days`.
+/// `completed` counts only gate-passed completions (state='done' with the
+/// completed outcome); `review`/`review_failed` surface the gate backlog so
+/// the panel shows work waiting on a checker, not silently "done".
 pub struct SeatProgress {
     pub seat: String,
     pub fired: i64,
@@ -320,6 +484,8 @@ pub struct SeatProgress {
     pub inflight: i64,
     pub stalled: i64,
     pub partial: i64,
+    pub review: i64,
+    pub review_failed: i64,
 }
 
 pub fn progress(c: &Connection, days: u64) -> Result<Vec<SeatProgress>> {
@@ -331,10 +497,12 @@ pub fn progress(c: &Connection, days: u64) -> Result<Vec<SeatProgress>> {
     let mut st = c.prepare(
         "SELECT seat,
             COUNT(*) AS fired,
-            SUM(outcome='completed') AS completed,
+            SUM(outcome='completed' AND state='done') AS completed,
             SUM(outcome IS NULL) AS inflight,
             SUM(outcome='stalled') AS stalled,
-            SUM(outcome='partial') AS partial
+            SUM(outcome='partial') AS partial,
+            SUM(state='review') AS review,
+            SUM(state='review_failed') AS review_failed
          FROM dispatches WHERE fired_at > ?1
          GROUP BY seat ORDER BY seat",
     )?;
@@ -347,10 +515,219 @@ pub fn progress(c: &Connection, days: u64) -> Result<Vec<SeatProgress>> {
                 inflight: r.get(3)?,
                 stalled: r.get(4)?,
                 partial: r.get(5)?,
+                review: r.get(6)?,
+                review_failed: r.get(7)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
+}
+
+// --- adversarial review gate face (FLEETD-GATE-001, 2026-11-28) ---
+
+/// One dispatch awaiting (or bounced from) adversarial review.
+#[derive(Debug, Clone)]
+pub struct ReviewRow {
+    pub id: i64,
+    pub seat: String,
+    pub tag: String,
+    /// 'review' (awaiting a checker) or 'review_failed' (bounced, re-opened,
+    /// awaiting the seat's next verdict).
+    pub state: String,
+    pub acceptance: Option<String>,
+    pub baseline_head: Option<String>,
+    pub head_at_finish: Option<String>,
+    pub fired_at: i64,
+    pub finished_at: Option<i64>,
+    pub reject_count: i64,
+    pub review_note: Option<String>,
+    pub evidence_path: Option<String>,
+}
+
+fn review_row(r: &rusqlite::Row) -> rusqlite::Result<ReviewRow> {
+    Ok(ReviewRow {
+        id: r.get(0)?,
+        seat: r.get(1)?,
+        tag: r.get(2)?,
+        state: r.get(3)?,
+        acceptance: r.get(4)?,
+        baseline_head: r.get(5)?,
+        head_at_finish: r.get(6)?,
+        fired_at: r.get(7)?,
+        finished_at: r.get(8)?,
+        reject_count: r.get(9)?,
+        review_note: r.get(10)?,
+        evidence_path: r.get(11)?,
+    })
+}
+
+const REVIEW_COLS: &str =
+    "id,seat,tag,state,acceptance,baseline_head,head_at_finish,fired_at,finished_at,\
+     reject_count,review_note,evidence_path";
+
+/// The review backlog: every dispatch in `review` or `review_failed`, newest
+/// fire first. This is the checker's work queue — entries leave only through
+/// review_pass / review_fail.
+pub fn review_list(c: &Connection) -> Result<Vec<ReviewRow>> {
+    let mut st = c.prepare(&format!(
+        "SELECT {REVIEW_COLS} FROM dispatches
+         WHERE state IN ('review','review_failed')
+         ORDER BY fired_at DESC"
+    ))?;
+    let rows = st
+        .query_map([], review_row)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+fn dispatch_state(c: &Connection, id: i64) -> Result<Option<String>> {
+    let mut st = c.prepare("SELECT state FROM dispatches WHERE id = ?1")?;
+    Ok(st
+        .query_row(rusqlite::params![id], |r| r.get(0))
+        .optional()?)
+}
+
+/// Pass a review: the dispatch lands as done and the evidence path is
+/// recorded for audit. Evidence is mandatory — "no evidence, no done" is
+/// the whole hook this gate exists to enforce.
+pub fn review_pass(c: &Connection, id: i64, evidence: &str) -> Result<()> {
+    let state = dispatch_state(c, id)?.context(format!("no such dispatch {id}"))?;
+    anyhow::ensure!(
+        state == "review",
+        "dispatch {id} is not awaiting review (state={state})"
+    );
+    anyhow::ensure!(
+        !evidence.trim().is_empty(),
+        "evidence required: review pass without evidence is refused"
+    );
+    c.execute(
+        "UPDATE dispatches SET state='done', evidence_path=?2 WHERE id=?1",
+        rusqlite::params![id, evidence.trim()],
+    )?;
+    Ok(())
+}
+
+/// Fail a review: bounce the dispatch back to the seat — state becomes
+/// review_failed and the row re-opens (finished_at cleared) so the seat's
+/// next Stop-hook verdict re-classifies against it. The reason goes on the
+/// row (review_note) and into the event chain (review_rejected). Returns
+/// true when this bounce crossed the escalation threshold (>= 2 rejections
+/// escalates to the orchestrator).
+pub fn review_fail(c: &Connection, id: i64, reason: &str) -> Result<bool> {
+    let state = dispatch_state(c, id)?.context(format!("no such dispatch {id}"))?;
+    anyhow::ensure!(
+        state == "review",
+        "dispatch {id} is not awaiting review (state={state})"
+    );
+    anyhow::ensure!(
+        !reason.trim().is_empty(),
+        "reason required: a rejection must say what failed"
+    );
+    let (seat, rejects): (String, i64) = c.query_row(
+        "SELECT seat, reject_count FROM dispatches WHERE id = ?1",
+        rusqlite::params![id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    c.execute(
+        "UPDATE dispatches SET state='review_failed', review_note=?2,
+         reject_count=reject_count+1, finished_at=NULL, outcome=NULL WHERE id=?1",
+        rusqlite::params![id, reason.trim()],
+    )?;
+    record_event(
+        c,
+        &seat,
+        "review_rejected",
+        None,
+        Some(&format!("dispatch {id} bounced: {}", reason.trim())),
+    )?;
+    let escalated = rejects + 1 >= 2;
+    if escalated {
+        record_event(
+            c,
+            &seat,
+            "review_escalated",
+            None,
+            Some(&format!(
+                "dispatch {id} rejected {} times; orchestrator must intervene",
+                rejects + 1
+            )),
+        )?;
+    }
+    Ok(escalated)
+}
+
+/// Per-seat count of dispatches awaiting review — the board field every
+/// dashboard reads from /v1/fleet to see the gate backlog at a glance.
+pub fn review_counts_by_seat(c: &Connection) -> Result<Vec<(String, i64)>> {
+    let mut st = c.prepare(
+        "SELECT seat, COUNT(*) FROM dispatches
+         WHERE state='review' GROUP BY seat ORDER BY seat",
+    )?;
+    let rows = st
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Review-stale watchdog: reviews older than 24h get exactly one
+/// review_stale event each (deduped by the dispatch reference in the note).
+/// Deliberately NO auto-pass — a stale review keeps waiting; only the
+/// orchestrator decides (宁可积压不可虚过).
+pub fn review_stale_alerts(c: &Connection) -> Result<Vec<i64>> {
+    const REVIEW_STALE_SECS: i64 = 24 * 3600;
+    let cutoff = now_secs() - REVIEW_STALE_SECS;
+    let mut st = c.prepare(
+        "SELECT id, seat FROM dispatches
+         WHERE state='review' AND finished_at IS NOT NULL AND finished_at < ?1
+         ORDER BY id",
+    )?;
+    let stale: Vec<(i64, String)> = st
+        .query_map(rusqlite::params![cutoff], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut alerted = Vec::new();
+    for (id, seat) in stale {
+        let pattern = format!("dispatch={id} %");
+        let seen: bool = c
+            .query_row(
+                "SELECT 1 FROM events WHERE kind='review_stale' AND note LIKE ?1 LIMIT 1",
+                rusqlite::params![pattern],
+                |_r| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if !seen {
+            record_event(
+                c,
+                &seat,
+                "review_stale",
+                None,
+                Some(&format!(
+                    "dispatch={id} in review >24h; orchestrator check overdue"
+                )),
+            )?;
+            alerted.push(id);
+        }
+    }
+    Ok(alerted)
+}
+
+/// Append a control-plane event. Gate notifications ride the same events
+/// chain the Stop hooks write, so every existing reader sees them.
+pub fn record_event(
+    c: &Connection,
+    seat: &str,
+    kind: &str,
+    head: Option<&str>,
+    note: Option<&str>,
+) -> Result<()> {
+    let ts = now_secs();
+    c.execute(
+        "INSERT INTO events(ts,seat,head,kind,note) VALUES(?1,?2,?3,?4,?5)",
+        rusqlite::params![ts, seat, head, kind, note],
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -406,11 +783,15 @@ mod tests {
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 seat TEXT NOT NULL, tag TEXT NOT NULL, fired_at INTEGER NOT NULL,
                 baseline_head TEXT, finished_at INTEGER, outcome TEXT,
-                head_at_finish TEXT, open_at_finish INTEGER, dirty_at_finish INTEGER, note TEXT);
+                head_at_finish TEXT, open_at_finish INTEGER, dirty_at_finish INTEGER, note TEXT,
+                state TEXT NOT NULL DEFAULT 'active', acceptance TEXT,
+                evidence_path TEXT, review_note TEXT,
+                reject_count INTEGER NOT NULL DEFAULT 0);
              CREATE TABLE events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 ts INTEGER NOT NULL, seat TEXT NOT NULL, head TEXT,
-                open_count INTEGER, dirty_count INTEGER, kind TEXT, verdict TEXT);
+                open_count INTEGER, dirty_count INTEGER, kind TEXT, verdict TEXT,
+                note TEXT);
              CREATE TABLE presence (
                 seat TEXT PRIMARY KEY, state TEXT NOT NULL, transcript_path TEXT,
                 last_event_ts INTEGER, last_output_ts INTEGER, pending_tool_use INTEGER,
@@ -448,14 +829,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(v, Verdict::Completed);
-        let outcome: String = c
+        let (outcome, state): (String, String) = c
             .query_row(
-                "SELECT outcome FROM dispatches WHERE seat='kode'",
+                "SELECT outcome, state FROM dispatches WHERE seat='kode'",
                 [],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
         assert_eq!(outcome, "completed");
+        // The gate (FLEETD-GATE-001): a bare task defaults to adversarial,
+        // so the completed dispatch waits in review, not done.
+        assert_eq!(state, "review");
     }
 
     #[test]
@@ -576,7 +960,8 @@ mod tests {
     #[test]
     fn progress_counts_by_outcome() {
         let c = mem();
-        record_dispatch(&c, "kode", "t1", Some("aaa")).unwrap();
+        // t1 self-check: its completion passes the gate and counts as done.
+        record_dispatch(&c, "kode", "t1\nacceptance: self-check", Some("aaa")).unwrap();
         ingest(
             &c,
             &SeatEvent {
@@ -807,6 +1192,254 @@ mod tests {
         assert!(set_executor(&c, "boxcar", "").is_err());
         // The rejection must not have written a row.
         assert_eq!(executor_of(&c, "boxcar").unwrap(), "tmux");
+    }
+
+    // --- adversarial review gate (FLEETD-GATE-001, 2026-11-28) ---
+
+    /// Drive one dispatch to the review state (adversarial default).
+    fn dispatch_in_review(c: &Connection, seat: &str, tag: &str) -> i64 {
+        record_dispatch(c, seat, tag, Some("aaa")).unwrap();
+        ingest(
+            c,
+            &SeatEvent {
+                seat: seat.into(),
+                head: Some("bbb".into()),
+                open: Some(0),
+                blocked: Some(0),
+                dirty: Some(0),
+                kind: "stop".into(),
+            },
+        )
+        .unwrap();
+        c.query_row(
+            "SELECT id FROM dispatches WHERE seat=?1 ORDER BY id DESC LIMIT 1",
+            rusqlite::params![seat],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn dispatch_col(c: &Connection, id: i64, col: &str) -> String {
+        c.query_row(
+            &format!("SELECT {col} FROM dispatches WHERE id=?1"),
+            rusqlite::params![id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn event_count(c: &Connection, kind: &str) -> i64 {
+        c.query_row(
+            "SELECT COUNT(*) FROM events WHERE kind=?1",
+            rusqlite::params![kind],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn completed_adversarial_enters_review_with_pending_event() {
+        let c = mem();
+        let id = dispatch_in_review(&c, "kode", "kode-x-001");
+        assert_eq!(dispatch_col(&c, id, "state"), "review");
+        assert_eq!(dispatch_col(&c, id, "outcome"), "completed");
+        assert_eq!(dispatch_col(&c, id, "acceptance"), "adversarial");
+        assert_eq!(event_count(&c, "review_pending"), 1);
+    }
+
+    #[test]
+    fn completed_self_check_lands_done_without_review() {
+        let c = mem();
+        let id = dispatch_in_review(&c, "kode", "t-docs\nacceptance: self-check");
+        assert_eq!(dispatch_col(&c, id, "state"), "done");
+        assert_eq!(dispatch_col(&c, id, "acceptance"), "self-check");
+        assert_eq!(event_count(&c, "review_pending"), 0);
+    }
+
+    #[test]
+    fn completed_user_verify_enters_review_and_flags_it() {
+        let c = mem();
+        let id = dispatch_in_review(&c, "kode", "t-beacon\nacceptance: user-verify");
+        assert_eq!(dispatch_col(&c, id, "state"), "review");
+        assert_eq!(dispatch_col(&c, id, "acceptance"), "user-verify");
+        let note: String = c
+            .query_row(
+                "SELECT note FROM events WHERE kind='review_pending'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(note.contains("user-verify"), "user-verify marker: {note}");
+    }
+
+    #[test]
+    fn review_pass_without_evidence_is_refused() {
+        let c = mem();
+        let id = dispatch_in_review(&c, "kode", "kode-x-001");
+        assert!(review_pass(&c, id, "").is_err());
+        assert!(review_pass(&c, id, "   ").is_err());
+        assert_eq!(dispatch_col(&c, id, "state"), "review");
+    }
+
+    #[test]
+    fn review_pass_records_evidence_and_done() {
+        let c = mem();
+        let id = dispatch_in_review(&c, "kode", "kode-x-001");
+        review_pass(&c, id, "/tmp/fleetd-e2e/proof.txt").unwrap();
+        assert_eq!(dispatch_col(&c, id, "state"), "done");
+        assert_eq!(
+            dispatch_col(&c, id, "evidence_path"),
+            "/tmp/fleetd-e2e/proof.txt"
+        );
+        // Done is terminal: a second pass must refuse.
+        assert!(review_pass(&c, id, "/tmp/again.txt").is_err());
+    }
+
+    #[test]
+    fn review_fail_bounces_reopens_and_records_reason() {
+        let c = mem();
+        let id = dispatch_in_review(&c, "kode", "kode-x-001");
+        let escalated = review_fail(&c, id, "tests do not compile").unwrap();
+        assert!(!escalated, "first rejection does not escalate");
+        assert_eq!(dispatch_col(&c, id, "state"), "review_failed");
+        assert_eq!(dispatch_col(&c, id, "review_note"), "tests do not compile");
+        assert_eq!(dispatch_col(&c, id, "CAST(reject_count AS TEXT)"), "1");
+        // Re-opened: the seat's next Stop hook must be able to re-classify.
+        let finished: Option<i64> = c
+            .query_row(
+                "SELECT finished_at FROM dispatches WHERE id=?1",
+                rusqlite::params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(finished.is_none(), "bounced dispatch re-opens");
+        let note: String = c
+            .query_row(
+                "SELECT note FROM events WHERE kind='review_rejected'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(note.contains("tests do not compile"));
+    }
+
+    #[test]
+    fn review_fail_twice_escalates_to_orchestrator() {
+        let c = mem();
+        let id = dispatch_in_review(&c, "kode", "kode-x-001");
+        assert!(!review_fail(&c, id, "wrong repo").unwrap());
+        // Seat re-submits: baseline aaa, head still advanced → completed again.
+        ingest(
+            &c,
+            &SeatEvent {
+                seat: "kode".into(),
+                head: Some("ccc".into()),
+                open: Some(0),
+                blocked: Some(0),
+                dirty: Some(0),
+                kind: "stop".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(dispatch_col(&c, id, "state"), "review");
+        assert!(
+            review_fail(&c, id, "still wrong repo").unwrap(),
+            "second rejection escalates"
+        );
+        assert_eq!(dispatch_col(&c, id, "CAST(reject_count AS TEXT)"), "2");
+        assert_eq!(event_count(&c, "review_escalated"), 1);
+    }
+
+    #[test]
+    fn review_faces_reject_non_review_states() {
+        let c = mem();
+        // Active dispatch never entered review.
+        record_dispatch(&c, "kode", "kode-x-001", Some("aaa")).unwrap();
+        let id: i64 = c
+            .query_row("SELECT id FROM dispatches WHERE seat='kode'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(review_pass(&c, id, "/tmp/x").is_err());
+        assert!(review_fail(&c, id, "nope").is_err());
+        // Unknown id.
+        assert!(review_pass(&c, 9999, "/tmp/x").is_err());
+        assert!(review_fail(&c, 9999, "nope").is_err());
+    }
+
+    #[test]
+    fn bounced_dispatch_reclassifies_on_next_verdict() {
+        let c = mem();
+        let id = dispatch_in_review(&c, "kode", "kode-x-001");
+        review_fail(&c, id, "incomplete").unwrap();
+        // Next stop is partial (dirty tree): legacy semantics close it, no review.
+        ingest(
+            &c,
+            &SeatEvent {
+                seat: "kode".into(),
+                head: Some("bbb".into()),
+                open: Some(2),
+                blocked: Some(0),
+                dirty: Some(2),
+                kind: "stop".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(dispatch_col(&c, id, "state"), "done");
+        assert_eq!(dispatch_col(&c, id, "outcome"), "partial");
+        // A later completed stop re-enters review through the gate.
+        let id2 = dispatch_in_review(&c, "falcon", "falcon-t");
+        review_fail(&c, id2, "again").unwrap();
+        ingest(
+            &c,
+            &SeatEvent {
+                seat: "falcon".into(),
+                head: Some("ddd".into()),
+                open: Some(0),
+                blocked: Some(0),
+                dirty: Some(0),
+                kind: "stop".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(dispatch_col(&c, id2, "state"), "review");
+    }
+
+    #[test]
+    fn review_list_and_counts_surface_the_backlog() {
+        let c = mem();
+        let id = dispatch_in_review(&c, "kode", "kode-x-001");
+        dispatch_in_review(&c, "falcon", "falcon-docs\nacceptance: self-check"); // lands done
+        let counts = review_counts_by_seat(&c).unwrap();
+        assert_eq!(counts, vec![("kode".to_string(), 1)]);
+        let rows = review_list(&c).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, id);
+        assert_eq!(rows[0].seat, "kode");
+        assert_eq!(rows[0].state, "review");
+        assert_eq!(rows[0].baseline_head.as_deref(), Some("aaa"));
+        assert_eq!(rows[0].head_at_finish.as_deref(), Some("bbb"));
+        assert_eq!(rows[0].reject_count, 0);
+    }
+
+    #[test]
+    fn review_stale_alerts_fire_once_per_dispatch() {
+        let c = mem();
+        let id = dispatch_in_review(&c, "kode", "kode-x-001");
+        // Fresh review: nothing stale.
+        assert!(review_stale_alerts(&c).unwrap().is_empty());
+        // Age the review past 24h.
+        let old = now_secs() - 25 * 3600;
+        c.execute(
+            "UPDATE dispatches SET finished_at=?1 WHERE id=?2",
+            rusqlite::params![old, id],
+        )
+        .unwrap();
+        assert_eq!(review_stale_alerts(&c).unwrap(), vec![id]);
+        assert_eq!(event_count(&c, "review_stale"), 1);
+        // Dedupe: the second sweep must not re-alert.
+        assert!(review_stale_alerts(&c).unwrap().is_empty());
+        assert_eq!(event_count(&c, "review_stale"), 1);
     }
 }
 
