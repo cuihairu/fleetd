@@ -230,6 +230,8 @@ pub fn handle_stream<S: Read + Write + PeerAddr>(
         // dashboards ask for ?state=idle. `last_commit` = newest lifecycle
         // event ts for the seat from the ledger. `notes` (FLEETD-MEM-001) =
         // the seat's fleet-memory count, so dashboards read it in one trip.
+        // `executor` (FLEETD-EXECUTOR-001) = the seat's registered
+        // environment (tmux/container/native/vm; tmux when unregistered).
         Some("GET")
             if request_line.contains("/v1/fleet")
                 && !request_line.contains("/v1/fleet/summary") =>
@@ -242,16 +244,21 @@ pub fn handle_stream<S: Read + Write + PeerAddr>(
                     let rows = store::ledger::presence_rows(&c, &state_filter)?;
                     let counts: std::collections::HashMap<String, i64> =
                         store::ledger::memory_seat_counts(&c)?.into_iter().collect();
-                    Ok((rows, counts))
+                    let executors = store::ledger::executor_map(&c)?;
+                    Ok((rows, counts, executors))
                 });
                 match face {
-                    Ok((rows, counts)) => {
+                    Ok((rows, counts, executors)) => {
                         let arr: Vec<serde_json::Value> = rows
                             .iter()
                             .map(|r| {
                                 serde_json::json!({
                                     "seat": r.seat,
                                     "state": r.state,
+                                    "executor": executors
+                                        .get(&r.seat)
+                                        .map(String::as_str)
+                                        .unwrap_or("tmux"),
                                     "open": r.open,
                                     "blocked": r.blocked,
                                     "last_event_ts": r.last_event_ts,

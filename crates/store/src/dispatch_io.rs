@@ -22,6 +22,18 @@ pub fn run(
     let kind = agent_for(agent_spec);
     let agent = fleetd_core::agent::registry(kind);
 
+    // 0) executor routing (FLEETD-EXECUTOR-001): the seat's registered
+    // environment decides the delivery path — before any tmux probe, so a
+    // container/vm/native seat never gets tmux IO aimed at it.
+    let executor = crate::ledger::open()
+        .and_then(|c| crate::ledger::executor_of(&c, seat))
+        .unwrap_or_else(|_| {
+            fleetd_core::executor::Executor::default()
+                .as_str()
+                .to_string()
+        });
+    route_executor(&executor)?;
+
     // 1) safety flags
     let global_flag = std::path::Path::new("/home/cui/.hermes/noauto-nudge/ALL").exists();
     let seat_flag =
@@ -68,6 +80,24 @@ pub fn run(
     Ok(outcome)
 }
 
+/// Executor routing (FLEETD-EXECUTOR-001): which delivery path a seat's
+/// dispatch may take, by its registered environment. tmux is implemented
+/// (the agent::tmux_run face); container / native / vm are registered facts
+/// with an explicit placeholder — the container pilot ticket fills them in.
+/// The routing structure stands either way: callers branch on this verdict,
+/// not on tmux assumptions.
+pub fn route_executor(executor: &str) -> Result<(), String> {
+    match fleetd_core::executor::Executor::from_str(executor) {
+        Some(fleetd_core::executor::Executor::Tmux) => Ok(()),
+        Some(other) => Err(format!(
+            "executor '{}' not implemented yet (seat environment registered as {}; delivery lands with the container pilot)",
+            other.as_str(),
+            other.as_str()
+        )),
+        None => Err(format!("unknown executor: {executor}")),
+    }
+}
+
 /// Cooldown check: true when no dispatch for this seat in the last `secs`.
 fn cooldown_ok(seat: &str, secs: i64) -> bool {
     let Ok(c) = crate::ledger::open() else {
@@ -87,5 +117,33 @@ fn cooldown_ok(seat: &str, secs: i64) -> bool {
     match last {
         Some(ts) => now - ts >= secs,
         None => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::route_executor;
+
+    #[test]
+    fn tmux_routes_through() {
+        assert_eq!(route_executor("tmux"), Ok(()));
+    }
+
+    #[test]
+    fn unimplemented_environments_fail_with_explicit_error() {
+        for ex in ["container", "native", "vm"] {
+            let err = route_executor(ex).unwrap_err();
+            assert!(
+                err.contains("not implemented yet"),
+                "{ex} must say so plainly, got: {err}"
+            );
+            assert!(err.contains(ex), "{ex} named in the error, got: {err}");
+        }
+    }
+
+    #[test]
+    fn unknown_executor_names_are_rejected() {
+        assert!(route_executor("docker").is_err());
+        assert!(route_executor("").is_err());
     }
 }

@@ -29,6 +29,7 @@ toml = "0.8"
 rusqlite = { version = "0.32", features = ["bundled"] }
 dirs = "5"
 schemars = "1"
+libtmux = { version = "=0.1.2", features = ["blocking"] }
 
 [package]
 name = "fleetd"

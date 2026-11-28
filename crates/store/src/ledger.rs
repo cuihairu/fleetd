@@ -127,7 +127,13 @@ pub fn open() -> Result<Connection> {
     // Seat-control gate migration (2026-11-26 falcon incident): disabled
     // seats must be skipped by every auto-start path. ALTER with tolerance
     // for already-migrated databases.
-    for col in ["stopped_by TEXT", "stopped_at INTEGER"] {
+    // executor (FLEETD-EXECUTOR-001): seat environment dimension — every
+    // pre-existing seat is tmux, hence the NOT NULL DEFAULT 'tmux'.
+    for col in [
+        "stopped_by TEXT",
+        "stopped_at INTEGER",
+        "executor TEXT NOT NULL DEFAULT 'tmux'",
+    ] {
         let sql = format!("ALTER TABLE seats ADD COLUMN {col};");
         let _ = c.execute_batch(&sql); // duplicate-column errors are fine
     }
@@ -166,6 +172,49 @@ pub fn set_gate(c: &Connection, seat: &str, disabled: bool, by: &str) -> Result<
         rusqlite::params![seat, status, by, now],
     )?;
     Ok(())
+}
+
+/// Register a seat's executor dimension (FLEETD-EXECUTOR-001): which
+/// environment actually runs the agent process (tmux / container / native /
+/// vm). Unknown names are rejected here so the wire enum stays closed; the
+/// row is created when the seat was never seen (registration may precede the
+/// first tmux session).
+pub fn set_executor(c: &Connection, seat: &str, executor: &str) -> Result<()> {
+    let kind = fleetd_core::executor::Executor::from_str(executor)
+        .with_context(|| format!("unknown executor: {executor} (tmux/container/native/vm)"))?;
+    let now = chrono::Utc::now().timestamp();
+    c.execute(
+        "UPDATE seats SET executor = ?2, updated_at = ?3 WHERE seat = ?1",
+        rusqlite::params![seat, kind.as_str(), now],
+    )?;
+    c.execute(
+        "INSERT OR IGNORE INTO seats (seat, cwd, status, executor, updated_at)
+         VALUES (?1, '', 'idle', ?2, ?3)",
+        rusqlite::params![seat, kind.as_str(), now],
+    )?;
+    Ok(())
+}
+
+/// A seat's executor; tmux when the seat has no row (workspace-scan seats
+/// default to tmux, per the ticket). Never errors on a missing seat.
+pub fn executor_of(c: &Connection, seat: &str) -> Result<String> {
+    let mut st = c.prepare("SELECT executor FROM seats WHERE seat = ?1")?;
+    let ex: Option<String> = st.query_row([seat], |r| r.get(0)).optional()?;
+    Ok(ex.unwrap_or_else(|| {
+        fleetd_core::executor::Executor::default()
+            .as_str()
+            .to_string()
+    }))
+}
+
+/// seat → executor map for fleet-wide faces (/v1/fleet, `fleetd fleet`).
+/// Rows absent from seats read as tmux at the call site.
+pub fn executor_map(c: &Connection) -> Result<std::collections::HashMap<String, String>> {
+    let mut st = c.prepare("SELECT seat, executor FROM seats")?;
+    let rows = st
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+        .and_then(|m| m.collect::<std::result::Result<Vec<_>, _>>())?;
+    Ok(rows.into_iter().collect())
 }
 
 /// In-flight dispatch for a seat (tag + baseline), if any.
@@ -370,7 +419,13 @@ mod tests {
                 id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT NOT NULL,
                 seat TEXT, tag TEXT, content TEXT NOT NULL, source TEXT,
                 created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
-                UNIQUE(key));",
+                UNIQUE(key));
+             CREATE TABLE seats (
+                seat TEXT PRIMARY KEY, cwd TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'idle', current_tag TEXT,
+                baseline_head TEXT, updated_at INTEGER NOT NULL,
+                stopped_by TEXT, stopped_at INTEGER,
+                executor TEXT NOT NULL DEFAULT 'tmux');",
         )
         .unwrap();
         c
@@ -720,6 +775,38 @@ mod tests {
             counts,
             vec![("apollo".to_string(), 2), ("atlas".to_string(), 1)]
         );
+    }
+
+    #[test]
+    fn executor_defaults_to_tmux_for_unregistered_seats() {
+        let c = mem();
+        // No seats rows at all: every seat reads as tmux (workspace-scan default).
+        assert_eq!(executor_of(&c, "apollo").unwrap(), "tmux");
+        assert_eq!(executor_of(&c, "ghost").unwrap(), "tmux");
+        // And the map is empty — absent rows stay tmux at the call site.
+        assert!(executor_map(&c).unwrap().is_empty());
+    }
+
+    #[test]
+    fn set_executor_roundtrip_creates_and_updates_rows() {
+        let c = mem();
+        set_executor(&c, "boxcar", "container").unwrap();
+        assert_eq!(executor_of(&c, "boxcar").unwrap(), "container");
+        // Re-registering with a different environment updates in place.
+        set_executor(&c, "boxcar", "vm").unwrap();
+        assert_eq!(executor_of(&c, "boxcar").unwrap(), "vm");
+        // The map carries exactly the registered row.
+        let map = executor_map(&c).unwrap();
+        assert_eq!(map.get("boxcar").map(String::as_str), Some("vm"));
+    }
+
+    #[test]
+    fn set_executor_rejects_unknown_environment_names() {
+        let c = mem();
+        assert!(set_executor(&c, "boxcar", "docker").is_err());
+        assert!(set_executor(&c, "boxcar", "").is_err());
+        // The rejection must not have written a row.
+        assert_eq!(executor_of(&c, "boxcar").unwrap(), "tmux");
     }
 }
 

@@ -14,3 +14,4 @@ toml.workspace = true
 rusqlite.workspace = true
 dirs.workspace = true
 schemars.workspace = true
+libtmux.workspace = true

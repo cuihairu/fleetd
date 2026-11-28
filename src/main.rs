@@ -571,9 +571,15 @@ fn main() -> Result<()> {
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_secs_f64())
                         .unwrap_or_default();
+                    // Executor dimension (FLEETD-EXECUTOR-001): registered
+                    // environment per seat; workspace-scan seats without a
+                    // row read as tmux.
+                    let executors: std::collections::HashMap<String, String> = ledger::open()
+                        .and_then(|c| ledger::executor_map(&c))
+                        .unwrap_or_default();
                     println!(
-                        "{:<24} {:<9} {:<5} {:<8} {:<10} {}",
-                        "seat", "state", "open", "blocked", "last", "signal"
+                        "{:<24} {:<9} {:<10} {:<5} {:<8} {:<10} {}",
+                        "seat", "state", "executor", "open", "blocked", "last", "signal"
                     );
                     let mut fire_candidate = false;
                     for seat in &seats {
@@ -587,9 +593,10 @@ fn main() -> Result<()> {
                             .map(|a| format!("{a:.0}s"))
                             .unwrap_or_else(|| "-".into());
                         println!(
-                            "{:<24} {:<9} {:<5} {:<8} {:<10} {}",
+                            "{:<24} {:<9} {:<10} {:<5} {:<8} {:<10} {}",
                             seat,
                             state.as_str(),
+                            executors.get(seat).map(String::as_str).unwrap_or("tmux"),
                             open,
                             blocked,
                             last,
@@ -639,23 +646,40 @@ fn main() -> Result<()> {
                     println!("{name}: gate cleared (idle)");
                 }
                 Some("list") => {
-                    let mut st =
-                        c.prepare("SELECT seat, status, stopped_by FROM seats ORDER BY seat")?;
+                    let mut st = c.prepare(
+                        "SELECT seat, status, stopped_by, executor FROM seats ORDER BY seat",
+                    )?;
                     let rows = st.query_map([], |r| {
                         Ok((
                             r.get::<_, String>(0)?,
                             r.get::<_, String>(1)?,
                             r.get::<_, Option<String>>(2)?,
+                            r.get::<_, String>(3)?,
                         ))
                     })?;
                     for r in rows {
-                        let (seat, status, by) = r?;
+                        let (seat, status, by, executor) = r?;
                         let gate = if status == "disabled" { " [GATED]" } else { "" };
                         println!(
-                            "{seat:20} {status}{gate}{}",
+                            "{seat:20} {status}{gate}{} exec={executor}",
                             by.map(|b| format!(" by={b}")).unwrap_or_default()
                         );
                     }
+                }
+                // Explicit environment registration (FLEETD-EXECUTOR-001):
+                // seat register <name> [--executor tmux|container|native|vm].
+                // Default tmux; auto-discovery never sets anything but tmux.
+                Some("register") => {
+                    let name = args.get(3).context(
+                        "usage: fleetd seat register <name> [--executor tmux|container|native|vm]",
+                    )?;
+                    let executor = args
+                        .iter()
+                        .position(|a| a == "--executor")
+                        .and_then(|i| args.get(i + 1).cloned())
+                        .unwrap_or_else(|| "tmux".to_string());
+                    ledger::set_executor(&c, name, &executor)?;
+                    println!("{name}: registered executor={executor}");
                 }
                 Some("gate-check") => {
                     let name = args
