@@ -338,8 +338,21 @@ pub fn update_remote_windows(host: &str, restart: bool) -> Result<(String, Strin
          Write-Output ('stop_window_ms=' + [int]$t.TotalMilliseconds); \
          (Get-Service FleetD).Status"
     );
+    // The script rides a FILE, not the command line: a quoted one-liner
+    // inside `bash -c "ssh ... powershell -Command '...'"` gets its $vars
+    // expanded by the LOCAL bash (observed live 2026-11-28: $d/$t arrived
+    // empty and PowerShell died on a parse error before touching the
+    // service). scp the script, run it with -File — no quoting layers.
+    let ps_path = std::env::temp_dir().join("fleetd-imac-update.ps1");
+    std::fs::write(&ps_path, &ps).context("write update script")?;
     sh(&format!(
-        "ssh -o BatchMode=yes {host} \"powershell -NoProfile -Command '{ps}'\""
+        "scp -o BatchMode=yes {} {host}:C:/Users/cui/.fleetd/update.ps1",
+        ps_path.display()
+    ))
+    .with_context(|| format!("scp update script to {host}"))?;
+    sh(&format!(
+        "ssh -o BatchMode=yes {host} powershell -NoProfile -ExecutionPolicy \
+         Bypass -File C:/Users/cui/.fleetd/update.ps1"
     ))
     .with_context(|| format!("windows swap on {host}"))?;
     let from = BUILD_HASH.to_string();
