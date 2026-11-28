@@ -4,6 +4,12 @@
 //! `fleetd_core::presence`; this module owns the machine IO (tmux, files)
 //! and the write.
 //!
+//! Death-awareness layer (FLEETD-TMUXHOOK-001): serve startup (and each
+//! watch round) ensures the global tmux `remain-on-exit` option plus the
+//! `pane-died` / `session-closed` hooks that post the fast `pane_died`
+//! event to /v1/events; reconcile then reads #{pane_dead} to classify the
+//! seat as `dead` (corpse present, exit code queryable) rather than `gone`.
+//!
 //! Out of scope here (later tasks): stalled-dispatch backoff, the noauto
 //! flag, attach/memory surfaces.
 
@@ -38,10 +44,43 @@ fn capture_pane(seat: &str) -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
-/// Full classification pipeline for one seat: newest transcript -> tail
-/// classification -> pane veto for IDLE candidates. The pane is only read
-/// when the transcript says IDLE (the veto is never the primary signal).
+/// tmux ground truth for one seat's pane: `Some(exit_code)` when the pane's
+/// process is dead (remain-on-exit keeps the corpse so the exit code stays
+/// readable), None when alive or the session is gone.
+fn pane_death(seat: &str) -> Option<i32> {
+    let out = std::process::Command::new("tmux")
+        .args([
+            "display-message",
+            "-p",
+            "-t",
+            seat,
+            "#{pane_dead}:#{pane_dead_status}",
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    presence::pane_death_from_format(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Full classification pipeline for one seat: pane death (tmux ground truth)
+/// -> newest transcript -> tail classification -> pane veto for IDLE
+/// candidates. The pane is only read when the transcript says IDLE (the veto
+/// is never the primary signal) — except the death flag, which is checked
+/// unconditionally: a dead pane's claude is gone even when its transcript
+/// tail still looks fresh.
 pub fn classify_seat(seat: &str, now: f64) -> (State, Evidence, Option<std::path::PathBuf>) {
+    if let Some(code) = pane_death(seat) {
+        return (
+            State::Dead,
+            Evidence {
+                signal: format!("pane-dead-exit:{code}"),
+                ..Default::default()
+            },
+            None,
+        );
+    }
     let Some(transcript) = presence::latest_transcript(seat) else {
         return (
             State::Gone,
@@ -104,9 +143,59 @@ pub fn reconcile_round() -> Result<usize> {
     Ok(written)
 }
 
+/// The shell command a death hook runs (via tmux `run-shell`): POST the
+/// fast `pane_died` event for the dying seat to the flagship. The tmux
+/// server expands #{session_name} at fire time (the dead pane's session =
+/// the seat name). Transport: the local flagship unix socket when it
+/// exists, else the TCP loopback face (`serve --http`). Quoting: the JSON
+/// payload is double-quoted inside the run-shell's single quotes — tmux
+/// strips the outer quotes and hands the rest to /bin/sh; inner quotes
+/// must therefore be double (#{...} expands regardless of shell quoting).
+fn death_hook_command(port: u16) -> String {
+    let sock = crate::events::flagship_socket_path().display().to_string();
+    let tpl = r##"run-shell 'SOCK="{sock}"; if [ -S "$SOCK" ]; then curl -sf --max-time 3 --unix-socket "$SOCK" -X POST http://localhost/v1/events -d "{\"seat\":\"#{session_name}\",\"kind\":\"pane_died\",\"open\":0,\"blocked\":0,\"dirty\":0}"; else curl -sf --max-time 3 -X POST http://127.0.0.1:{port}/v1/events -d "{\"seat\":\"#{session_name}\",\"kind\":\"pane_died\",\"open\":0,\"blocked\":0,\"dirty\":0}"; fi'"##;
+    tpl.replace("{sock}", &sock)
+        .replace("{port}", &port.to_string())
+}
+
+/// Serve-startup ensure (FLEETD-TMUXHOOK-001), idempotent and re-entrant:
+/// - global `remain-on-exit on` so a crashed seat pane keeps its corpse
+///   (#{pane_dead}=1 + #{pane_dead_status} exit code stay readable);
+/// - global `pane-died` and `session-closed` hooks posting the fast
+///   `pane_died` event. set-hook/set-option overwrite by name, so serve
+///   restarts and per-round re-ensures have no side effects. Fleetd
+///   self-manages these — nothing is written to the user's tmux.conf.
+/// Returns false (and does nothing) when no tmux server is running:
+/// issuing set-option would otherwise spawn an empty tmux server.
+pub fn ensure_tmux_death_awareness(port: u16) -> bool {
+    let live = std::process::Command::new("tmux").arg("ls").output();
+    let server_up = match live {
+        Ok(o) => {
+            o.status.success() || !String::from_utf8_lossy(&o.stderr).contains("no server running")
+        }
+        Err(_) => false,
+    };
+    if !server_up {
+        return false;
+    }
+    let _ = std::process::Command::new("tmux")
+        .args(["set-option", "-g", "remain-on-exit", "on"])
+        .output();
+    let hook = death_hook_command(port);
+    for event in ["pane-died", "session-closed"] {
+        let _ = std::process::Command::new("tmux")
+            .args(["set-hook", "-g", event, &hook])
+            .output();
+    }
+    true
+}
+
 /// Long-running presence watch: one round every 60 seconds (serve thread).
-pub fn watch_forever() -> ! {
+/// Each round re-ensures the death-awareness hooks first — a tmux server
+/// restart drops hooks and options, and this heals them within one cycle.
+pub fn watch_forever(port: u16) -> ! {
     loop {
+        let _ = ensure_tmux_death_awareness(port);
         match reconcile_round() {
             Ok(n) if n > 0 => eprintln!("presence: reconciled {n} seat(s)"),
             Ok(_) => {}
@@ -133,5 +222,29 @@ mod tests {
     fn todo_counts_missing_seat_is_zero() {
         let (open, blocked) = presence::todo_counts("fleetd-no-such-seat");
         assert_eq!((open, blocked), (0, 0));
+    }
+
+    #[test]
+    fn pane_death_missing_session_is_none() {
+        // No such tmux session: display-message fails -> not dead (the
+        // transcript path decides, as before the death layer existed).
+        let seat = format!("fleetd-no-such-seat-{}", std::process::id());
+        assert_eq!(pane_death(&seat), None);
+    }
+
+    #[test]
+    fn death_hook_carries_seat_placeholder_and_kind() {
+        let cmd = death_hook_command(3790);
+        // The seat comes from tmux expansion at fire time, never baked in.
+        assert!(cmd.contains("#{session_name}"));
+        // JSON quotes are escaped for the sh layer (\" inside the run-shell).
+        assert!(cmd.contains(r#"\"kind\":\"pane_died\""#));
+        // Both faces: unix socket first, TCP loopback fallback.
+        assert!(cmd.contains("--unix-socket"));
+        assert!(cmd.contains("127.0.0.1:3790/v1/events"));
+        assert!(cmd.starts_with("run-shell '"));
+        // Exactly the two outer single quotes — the payload must not break
+        // the run-shell quoting.
+        assert_eq!(cmd.matches('\'').count(), 2);
     }
 }

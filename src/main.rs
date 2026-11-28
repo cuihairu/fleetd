@@ -1326,9 +1326,15 @@ fn run_serve_cli(args: &[String]) -> Result<()> {
             });
         });
     }
+    // Death-aware tmux layer (FLEETD-TMUXHOOK-001): global remain-on-exit +
+    // pane-died/session-closed hooks posting pane_died to /v1/events. The
+    // watch re-ensures each round, so a tmux server restart heals itself.
+    if scheduler::presence::ensure_tmux_death_awareness(port) {
+        eprintln!("fleetd: tmux death-awareness installed (remain-on-exit, pane-died hooks)");
+    }
     // Presence watch (FLEETD-PRESENCE-001): reconcile seat liveness into the
     // presence table every 60 s, independent of the job scheduler flag.
-    std::thread::spawn(|| scheduler::presence::watch_forever());
+    std::thread::spawn(move || scheduler::presence::watch_forever(port));
     // 通信面(2026-11-27 钦定):本机默认走 UNIX socket(~/.fleetd/flagship.sock,
     // Windows 同 AF_UNIX);--http 显式开启才起 TCP HTTP 面(跨机 relay/面板)。
     let http = args.iter().any(|a| a == "--http");

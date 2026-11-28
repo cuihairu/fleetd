@@ -176,6 +176,10 @@ pub fn inflight(c: &Connection, seat: &str) -> Result<Option<(i64, String, Optio
 
 /// Kinds that carry a terminal state worth classifying a dispatch against.
 /// notification/compact are observational — they must NOT close a dispatch.
+/// pane_died (FLEETD-TMUXHOOK-001, the tmux death hook) is observational
+/// too: it records the fact that a seat's pane exited, but whether that
+/// seat's work actually completed stays with the presence reconcile layer,
+/// which reads tmux ground truth instead of trusting the event.
 fn is_terminal_kind(kind: &str) -> bool {
     matches!(
         kind,
@@ -457,6 +461,43 @@ mod tests {
             )
             .unwrap();
         assert_eq!(outcome2, "completed");
+    }
+
+    #[test]
+    fn pane_died_event_is_observational() {
+        // The tmux death hook's kind records the death without closing the
+        // in-flight dispatch: death vs completion stays with the reconcile
+        // layer (FLEETD-TMUXHOOK-001).
+        let c = mem();
+        record_dispatch(&c, "kode", "t1", Some("aaa")).unwrap();
+        let v = ingest(
+            &c,
+            &SeatEvent {
+                seat: "kode".into(),
+                head: Some("bbb".into()),
+                open: Some(0),
+                blocked: Some(0),
+                dirty: Some(0),
+                kind: "pane_died".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(v, Verdict::Untracked);
+        let (finished, outcome): (Option<i64>, Option<String>) = c
+            .query_row(
+                "SELECT finished_at, outcome FROM dispatches WHERE seat='kode'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(finished.is_none(), "pane_died must NOT close the dispatch");
+        assert!(outcome.is_none());
+        let kind: String = c
+            .query_row("SELECT kind FROM events WHERE seat='kode'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(kind, "pane_died");
     }
 
     #[test]

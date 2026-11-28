@@ -7,7 +7,9 @@
 //! The Stop hook never classifies anything itself: it only reports
 //! {seat, head, open, dirty}; this module compares against the dispatch
 //! baseline and records the verdict (completed / partial / stalled /
-//! no_progress / untracked).
+//! no_progress / untracked). The tmux death hooks (FLEETD-TMUXHOOK-001)
+//! post `kind=pane_died` on the same face — observational: recorded, never
+//! closes a dispatch; the presence reconcile layer owns death semantics.
 
 use anyhow::{bail, Context, Result};
 use std::io::{Read, Write};

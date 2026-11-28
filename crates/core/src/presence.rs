@@ -13,6 +13,9 @@
 //! - IDLE     last event >= 240 s old and the pane shows no live spinner
 //!            (pane capture is the final veto, never the primary signal)
 //! - GONE     no transcript at all
+//! - DEAD     the seat's tmux pane process exited (remain-on-exit keeps the
+//!            corpse: #{pane_dead}=1 + #{pane_dead_status} exit code) —
+//!            distinct from GONE so "why did it die" stays queryable
 //! - DRAINING hysteresis band between ACTIVE and IDLE (90–240 s): recent
 //!            activity, not yet provably idle
 
@@ -39,6 +42,7 @@ pub enum State {
     Draining,
     Idle,
     Stuck,
+    Dead,
     Gone,
 }
 
@@ -49,6 +53,7 @@ impl State {
             State::Draining => "draining",
             State::Idle => "idle",
             State::Stuck => "stuck",
+            State::Dead => "dead",
             State::Gone => "gone",
         }
     }
@@ -333,6 +338,19 @@ pub fn veto_idle(state: State, pane: Option<&str>, mut ev: Evidence) -> (State, 
     (state, ev)
 }
 
+/// Parse `tmux display-message -p '#{pane_dead}:#{pane_dead_status}'`
+/// output: `Some(exit_code)` when the pane process is dead, None when it is
+/// alive or the line is unparseable (garbled reads as alive — the transcript
+/// path still rules in that case). An empty exit status parses as -1: dead,
+/// exit code unknown.
+pub fn pane_death_from_format(s: &str) -> Option<i32> {
+    let (dead, status) = s.trim().split_once(':')?;
+    if dead != "1" {
+        return None;
+    }
+    Some(status.trim().parse().unwrap_or(-1))
+}
+
 /// Claude Code transcript directory for one workspace seat (the reference
 /// script scans the same glob).
 pub fn projects_dir(seat: &str) -> std::path::PathBuf {
@@ -582,6 +600,24 @@ mod tests {
         assert_eq!(State::Draining.as_str(), "draining");
         assert_eq!(State::Idle.as_str(), "idle");
         assert_eq!(State::Stuck.as_str(), "stuck");
+        assert_eq!(State::Dead.as_str(), "dead");
         assert_eq!(State::Gone.as_str(), "gone");
+    }
+
+    #[test]
+    fn pane_death_format_yields_exit_code() {
+        assert_eq!(pane_death_from_format("1:143\n"), Some(143));
+        assert_eq!(pane_death_from_format("1:0"), Some(0));
+        // Dead with no recorded status: -1 = exit code unknown.
+        assert_eq!(pane_death_from_format("1:"), Some(-1));
+        assert_eq!(pane_death_from_format("1:-15"), Some(-15));
+    }
+
+    #[test]
+    fn pane_alive_or_garbled_format_is_not_dead() {
+        assert_eq!(pane_death_from_format("0:"), None);
+        assert_eq!(pane_death_from_format("0:0"), None);
+        assert_eq!(pane_death_from_format(""), None);
+        assert_eq!(pane_death_from_format("garbled"), None);
     }
 }
