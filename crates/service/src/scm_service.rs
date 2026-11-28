@@ -19,9 +19,7 @@ use windows_service::service::{
 };
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
 use windows_service::{
-    define_windows_service,
-    service_control_handler::ServiceStatusHandle,
-    service_dispatcher,
+    define_windows_service, service_control_handler::ServiceStatusHandle, service_dispatcher,
 };
 
 define_windows_service!(ffi_service_main, fleetd_service_main);

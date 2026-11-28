@@ -213,7 +213,10 @@ mod tests {
     }
 
     fn cfg(hosts: Vec<Host>) -> FleetConfig {
-        FleetConfig { hosts, workers: Vec::new() }
+        FleetConfig {
+            hosts,
+            workers: Vec::new(),
+        }
     }
 
     #[test]

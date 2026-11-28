@@ -244,7 +244,10 @@ fn dispatch(cfg: &FleetConfig, task_file: &str, repo: &str) -> Result<()> {
         .map(|h| h.name.clone())
         .collect();
     if !gated.is_empty() {
-        println!("DISPATCH gate: skipping disabled seats: {}", gated.join(", "));
+        println!(
+            "DISPATCH gate: skipping disabled seats: {}",
+            gated.join(", ")
+        );
     }
     let mut running = Vec::new();
     for h in &cfg.hosts {
@@ -472,7 +475,11 @@ fn main() -> Result<()> {
                     fleet_view::run(&flagship, follow).map_err(|e| anyhow::anyhow!(e))?;
                 }
                 Some("ships") => {
-                    println!("self ship = {}{}", t.ship.name, if t.is_flagship() { " (FLAGSHIP)" } else { "" });
+                    println!(
+                        "self ship = {}{}",
+                        t.ship.name,
+                        if t.is_flagship() { " (FLAGSHIP)" } else { "" }
+                    );
                     for s in &t.fleet.ships {
                         println!("  ship {} via ssh {}", s.name, s.ssh);
                     }
@@ -617,7 +624,14 @@ fn main() -> Result<()> {
                     }
                     // Layer 3: gate
                     ledger::set_gate(&c, name, true, "user")?;
-                    println!("{name}: {} + gate=disabled", if hard { "session+procs killed" } else { "gate only" });
+                    println!(
+                        "{name}: {} + gate=disabled",
+                        if hard {
+                            "session+procs killed"
+                        } else {
+                            "gate only"
+                        }
+                    );
                 }
                 Some("enable") => {
                     let name = args.get(3).context("usage: fleetd seat enable <name>")?;
@@ -625,34 +639,61 @@ fn main() -> Result<()> {
                     println!("{name}: gate cleared (idle)");
                 }
                 Some("list") => {
-                    let mut st = c.prepare(
-                        "SELECT seat, status, stopped_by FROM seats ORDER BY seat")?;
+                    let mut st =
+                        c.prepare("SELECT seat, status, stopped_by FROM seats ORDER BY seat")?;
                     let rows = st.query_map([], |r| {
-                        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?))
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, Option<String>>(2)?,
+                        ))
                     })?;
                     for r in rows {
                         let (seat, status, by) = r?;
                         let gate = if status == "disabled" { " [GATED]" } else { "" };
-                        println!("{seat:20} {status}{gate}{}", by.map(|b| format!(" by={b}")).unwrap_or_default());
+                        println!(
+                            "{seat:20} {status}{gate}{}",
+                            by.map(|b| format!(" by={b}")).unwrap_or_default()
+                        );
                     }
                 }
                 Some("gate-check") => {
-                    let name = args.get(3).context("usage: fleetd seat gate-check <name>")?;
-                    println!("{}", if ledger::is_disabled(&c, name)? { "DISABLED" } else { "ALLOWED" });
+                    let name = args
+                        .get(3)
+                        .context("usage: fleetd seat gate-check <name>")?;
+                    println!(
+                        "{}",
+                        if ledger::is_disabled(&c, name)? {
+                            "DISABLED"
+                        } else {
+                            "ALLOWED"
+                        }
+                    );
                 }
                 Some("fire") => {
                     // seat fire <name> <task-file>: paste a task one-liner into
                     // the seat's claude composer (absorbs fire_seat.sh).
-                    let name = args.get(3).context("usage: fleetd seat fire <name> <task.md>")?;
-                    let task = args.get(4).context("usage: fleetd seat fire <name> <task.md>")?;
+                    let name = args
+                        .get(3)
+                        .context("usage: fleetd seat fire <name> <task.md>")?;
+                    let task = args
+                        .get(4)
+                        .context("usage: fleetd seat fire <name> <task.md>")?;
                     if ledger::is_disabled(&c, name)? {
                         anyhow::bail!("{name} is GATED — fleetd seat enable {name} first");
                     }
                     let has = std::process::Command::new("tmux")
                         .args(["has-session", "-t", name])
-                        .output()?.status.success();
-                    if !has { anyhow::bail!("{name}: NO_SESSION"); }
-                    let text = format!("执行 {task} (dispatch {})", chrono::Local::now().format("%Y-%m-%d"));
+                        .output()?
+                        .status
+                        .success();
+                    if !has {
+                        anyhow::bail!("{name}: NO_SESSION");
+                    }
+                    let text = format!(
+                        "执行 {task} (dispatch {})",
+                        chrono::Local::now().format("%Y-%m-%d")
+                    );
                     let mut paste = std::process::Command::new("tmux")
                         .args(["load-buffer", "-b", "fleetd-fire", "-"])
                         .stdin(std::process::Stdio::piped())
@@ -684,7 +725,14 @@ fn main() -> Result<()> {
                     let _ = std::process::Command::new("tmux")
                         .args(["send-keys", "-t", name, "Enter"])
                         .output()?;
-                    println!("{name} | {}", if delivered { "DELIVERED" } else { "PASTED (verify fold)" });
+                    println!(
+                        "{name} | {}",
+                        if delivered {
+                            "DELIVERED"
+                        } else {
+                            "PASTED (verify fold)"
+                        }
+                    );
                 }
                 _ => println!("usage: fleetd seat stop|disable|enable|fire|list|gate-check [name]"),
             }
@@ -698,7 +746,8 @@ fn main() -> Result<()> {
             let mut any = false;
             let mut entries: Vec<(String, i64)> = Vec::new();
             let rd = std::fs::read_dir(root)?;
-            for e in rd { let e = e?;
+            for e in rd {
+                let e = e?;
                 if !e.file_type()?.is_dir() {
                     continue;
                 }
@@ -708,7 +757,11 @@ fn main() -> Result<()> {
                     todo
                 } else {
                     let t = e.path().join("TODO.md");
-                    if t.exists() { t } else { continue }
+                    if t.exists() {
+                        t
+                    } else {
+                        continue;
+                    }
                 };
                 let body = std::fs::read_to_string(&todo).unwrap_or_default();
                 // open items carrying a blocker marker, same rule as the hook
@@ -802,10 +855,18 @@ fn main() -> Result<()> {
         // --- init / bootstrap ---
         Some("init") => {
             let c = ledger::open()?;
-            println!("fleetd ledger initialized at {}", ledger::db_path().display());
-            let n: i64 = c.query_row("SELECT COUNT(*) FROM dispatches", [], |r| r.get(0)).unwrap_or(0);
-            println!("dispatches={n} seats={}",
-                c.query_row("SELECT COUNT(*) FROM seats", [], |r| r.get(0)).unwrap_or(0));
+            println!(
+                "fleetd ledger initialized at {}",
+                ledger::db_path().display()
+            );
+            let n: i64 = c
+                .query_row("SELECT COUNT(*) FROM dispatches", [], |r| r.get(0))
+                .unwrap_or(0);
+            println!(
+                "dispatches={n} seats={}",
+                c.query_row("SELECT COUNT(*) FROM seats", [], |r| r.get(0))
+                    .unwrap_or(0)
+            );
         }
         Some("status") => {
             status(cfg.as_ref().context("config required")?)?;
@@ -834,7 +895,10 @@ fn main() -> Result<()> {
             // todo content), picks an idle seat on the resolved repo, fires.
             // No IDs, no file paths — the user speaks, fleetd finds the target.
             let nl = args[2..].join(" ");
-            anyhow::ensure!(!nl.is_empty(), "usage: fleetd dispatch \"自然语言任务描述\"");
+            anyhow::ensure!(
+                !nl.is_empty(),
+                "usage: fleetd dispatch \"自然语言任务描述\""
+            );
             let c = ledger::open()?;
             let root = std::path::Path::new("/home/cui/workspaces");
             // score every workspace dir against the description (name tokens + todo hits)
@@ -845,7 +909,8 @@ fn main() -> Result<()> {
                 .filter(|t| t.len() >= 2)
                 .collect();
             let rd = std::fs::read_dir(root)?;
-            for e in rd { let e = e?;
+            for e in rd {
+                let e = e?;
                 if !e.file_type()?.is_dir() {
                     continue;
                 }
@@ -867,12 +932,18 @@ fn main() -> Result<()> {
                     todo
                 } else {
                     let t2 = e.path().join("TODO.md");
-                    if t2.exists() { t2 } else {
-                        if score > 0 { scored.push((score, e.file_name().to_string_lossy().to_string())); }
+                    if t2.exists() {
+                        t2
+                    } else {
+                        if score > 0 {
+                            scored.push((score, e.file_name().to_string_lossy().to_string()));
+                        }
                         continue;
                     }
                 };
-                let body = std::fs::read_to_string(&todo).unwrap_or_default().to_lowercase();
+                let body = std::fs::read_to_string(&todo)
+                    .unwrap_or_default()
+                    .to_lowercase();
                 for t in &tokens {
                     // count token hits inside the todo body (capped to avoid flood)
                     let hits = body.matches(t).count().min(20) as i64;
@@ -899,12 +970,19 @@ fn main() -> Result<()> {
             let task = nl.clone();
             let has = std::process::Command::new("tmux")
                 .args(["has-session", "-t", &seat_dir])
-                .output()?.status.success();
-            if !has { anyhow::bail!("{seat_dir}: NO_SESSION — cannot deliver"); }
+                .output()?
+                .status
+                .success();
+            if !has {
+                anyhow::bail!("{seat_dir}: NO_SESSION — cannot deliver");
+            }
             if ledger::is_disabled(&c, &seat_dir)? {
                 anyhow::bail!("{seat_dir} is GATED — fleetd seat enable {seat_dir} first");
             }
-            let text = format!("{task} (fleetd dispatch {})", chrono::Local::now().format("%Y-%m-%d %H:%M"));
+            let text = format!(
+                "{task} (fleetd dispatch {})",
+                chrono::Local::now().format("%Y-%m-%d %H:%M")
+            );
             let mut paste = std::process::Command::new("tmux")
                 .args(["load-buffer", "-b", "fleetd-fire", "-"])
                 .stdin(std::process::Stdio::piped())
@@ -927,7 +1005,14 @@ fn main() -> Result<()> {
                 .args(["send-keys", "-t", &seat_dir, "Enter"])
                 .output()?;
             ledger::record_dispatch(&c, &seat_dir, &task, None)?;
-            println!("{seat_dir} | {}", if delivered { "DELIVERED" } else { "PASTED (verify fold)" });
+            println!(
+                "{seat_dir} | {}",
+                if delivered {
+                    "DELIVERED"
+                } else {
+                    "PASTED (verify fold)"
+                }
+            );
         }
         Some("dispatch-file") => {
             let task_file = args
@@ -984,23 +1069,27 @@ fn main() -> Result<()> {
             }
         }
         // --- relay F2: queue pull-dispatch + agent liveness ---
-        Some("relay") => {
-            match args.get(2).map(String::as_str) {
-                Some("queue") => {
-                    let seat = args.get(3).context("usage: fleetd relay queue <seat> <task.md> <repo>")?;
-                    let task_file = args.get(4).context("usage: fleetd relay queue <seat> <task.md> <repo>")?;
-                    let repo = args.get(5).context("usage: fleetd relay queue <seat> <task.md> <repo>")?;
-                    let id = relay::forward::queue_pull(seat, task_file, repo)?;
-                    println!("queued pull id={id} seat={seat} (delivered on next heartbeat)");
-                }
-                Some("alive") => {
-                    for (seat, ts) in relay::relay::alive_since(15)? {
-                        println!("{seat} last-heartbeat {ts}s-epoch");
-                    }
-                }
-                _ => println!("usage: fleetd relay queue <seat> <task.md> <repo> | relay alive"),
+        Some("relay") => match args.get(2).map(String::as_str) {
+            Some("queue") => {
+                let seat = args
+                    .get(3)
+                    .context("usage: fleetd relay queue <seat> <task.md> <repo>")?;
+                let task_file = args
+                    .get(4)
+                    .context("usage: fleetd relay queue <seat> <task.md> <repo>")?;
+                let repo = args
+                    .get(5)
+                    .context("usage: fleetd relay queue <seat> <task.md> <repo>")?;
+                let id = relay::forward::queue_pull(seat, task_file, repo)?;
+                println!("queued pull id={id} seat={seat} (delivered on next heartbeat)");
             }
-        }
+            Some("alive") => {
+                for (seat, ts) in relay::relay::alive_since(15)? {
+                    println!("{seat} last-heartbeat {ts}s-epoch");
+                }
+            }
+            _ => println!("usage: fleetd relay queue <seat> <task.md> <repo> | relay alive"),
+        },
         // --- self service registration (per-OS native mechanism) ---
         Some("service") => {
             let exe = std::env::current_exe()
@@ -1028,27 +1117,27 @@ fn main() -> Result<()> {
                                 "{}/Library/LaunchAgents/ai.fleetd.plist",
                                 std::env::var("HOME").unwrap_or_default()
                             );
-                            let r = Command::new("launchctl").args([verb_launch, &plist]).output()?;
+                            let r = Command::new("launchctl")
+                                .args([verb_launch, &plist])
+                                .output()?;
                             println!("macos: launchctl {} → {}", verb_launch, r.status.success());
                         }
                     }
                 }
-                Some("status") => {
-                    match service::detect() {
-                        service::Platform::Windows => {
-                            let r = Command::new("cmd")
-                                .args(["/c", "sc query FleetD"])
-                                .output()?;
-                            print!("{}", String::from_utf8_lossy(&r.stdout));
-                        }
-                        _ => {
-                            let r = Command::new("systemctl")
-                                .args(["--user", "status", "fleetd"])
-                                .output()?;
-                            print!("{}", String::from_utf8_lossy(&r.stdout));
-                        }
+                Some("status") => match service::detect() {
+                    service::Platform::Windows => {
+                        let r = Command::new("cmd")
+                            .args(["/c", "sc query FleetD"])
+                            .output()?;
+                        print!("{}", String::from_utf8_lossy(&r.stdout));
                     }
-                }
+                    _ => {
+                        let r = Command::new("systemctl")
+                            .args(["--user", "status", "fleetd"])
+                            .output()?;
+                        print!("{}", String::from_utf8_lossy(&r.stdout));
+                    }
+                },
                 Some("install") | Some("uninstall") => {
                     let uninstall = args.get(2).map(String::as_str) == Some("uninstall");
                     match service::detect() {
@@ -1058,16 +1147,22 @@ fn main() -> Result<()> {
                                 std::env::var("HOME").unwrap_or_default()
                             );
                             if uninstall {
-                                let _ = Command::new("systemctl").args(["--user", "stop", "fleetd"]).output();
+                                let _ = Command::new("systemctl")
+                                    .args(["--user", "stop", "fleetd"])
+                                    .output();
                                 let _ = std::fs::remove_file(&unit_path);
-                                let _ = Command::new("systemctl").args(["--user", "daemon-reload"]).output();
+                                let _ = Command::new("systemctl")
+                                    .args(["--user", "daemon-reload"])
+                                    .output();
                                 println!("linux: unit removed");
                             } else {
                                 std::fs::create_dir_all(
-                                    std::path::Path::new(&unit_path).parent().unwrap()
+                                    std::path::Path::new(&unit_path).parent().unwrap(),
                                 )?;
                                 std::fs::write(&unit_path, service::systemd_unit(&exe))?;
-                                let _ = Command::new("systemctl").args(["--user", "daemon-reload"]).output();
+                                let _ = Command::new("systemctl")
+                                    .args(["--user", "daemon-reload"])
+                                    .output();
                                 let en = Command::new("systemctl")
                                     .args(["--user", "enable", "--now", "fleetd"])
                                     .output()?;
@@ -1081,7 +1176,9 @@ fn main() -> Result<()> {
                             // Real SCM service + a separate tray ONLOGON task.
                             if uninstall {
                                 let _ = Command::new("cmd").args(["/c", "sc stop FleetD"]).output();
-                                let _ = Command::new("cmd").args(["/c", "sc delete FleetD"]).output();
+                                let _ = Command::new("cmd")
+                                    .args(["/c", "sc delete FleetD"])
+                                    .output();
                                 let _ = Command::new("schtasks")
                                     .args(["/Delete", "/TN", "FleetDTray", "/F"])
                                     .output();
@@ -1104,10 +1201,11 @@ fn main() -> Result<()> {
                                 println!("macos: plist unloaded+removed");
                             } else {
                                 std::fs::create_dir_all(
-                                    std::path::Path::new(&plist).parent().unwrap()
+                                    std::path::Path::new(&plist).parent().unwrap(),
                                 )?;
                                 std::fs::write(&plist, service::launchd_plist(&exe))?;
-                                let l = Command::new("launchctl").args(["load", &plist]).output()?;
+                                let l =
+                                    Command::new("launchctl").args(["load", &plist]).output()?;
                                 println!("macos: plist loaded = {}", l.status.success());
                             }
                         }
@@ -1119,51 +1217,57 @@ fn main() -> Result<()> {
             }
         }
         // --- agent toolchain lifecycle: install/inventory across hosts ---
-        Some("tools") => {
-            match args.get(2).map(String::as_str) {
-                Some("list") => {
-                    let hosts = ["local", "work-runner", "imac"];
-                    for t in [tools::Tool::Claude, tools::Tool::Codex, tools::Tool::Opencode] {
-                        println!("{}:", t.name());
-                        for (h, v) in tools::inventory(&hosts, t) {
-                            println!("  {h:<14} {v}");
-                        }
+        Some("tools") => match args.get(2).map(String::as_str) {
+            Some("list") => {
+                let hosts = ["local", "work-runner", "imac"];
+                for t in [
+                    tools::Tool::Claude,
+                    tools::Tool::Codex,
+                    tools::Tool::Opencode,
+                ] {
+                    println!("{}:", t.name());
+                    for (h, v) in tools::inventory(&hosts, t) {
+                        println!("  {h:<14} {v}");
                     }
-                }
-                Some("install") => {
-                    let agent = args.get(3).context("usage: fleetd tools install <claude|codex|opencode> [--host <alias>]")?;
-                    let tool = tools::Tool::from_str(agent)
-                        .context("unknown agent; supported: claude codex opencode")?;
-                    let host = args
-                        .iter()
-                        .position(|a| a == "--host")
-                        .and_then(|i| args.get(i + 1))
-                        .map(String::as_str)
-                        .unwrap_or("local");
-                    println!("installing {} on {host} (official installer)...", tool.name());
-                    match tools::install(host, tool) {
-                        Ok(v) => println!("OK: {} now {v}", tool.name()),
-                        Err(e) => anyhow::bail!("install failed: {e}"),
-                    }
-                }
-                _ => {
-                    println!("usage: fleetd tools list | tools install <agent> [--host <alias>]");
                 }
             }
-        }
+            Some("install") => {
+                let agent = args.get(3).context(
+                    "usage: fleetd tools install <claude|codex|opencode> [--host <alias>]",
+                )?;
+                let tool = tools::Tool::from_str(agent)
+                    .context("unknown agent; supported: claude codex opencode")?;
+                let host = args
+                    .iter()
+                    .position(|a| a == "--host")
+                    .and_then(|i| args.get(i + 1))
+                    .map(String::as_str)
+                    .unwrap_or("local");
+                println!(
+                    "installing {} on {host} (official installer)...",
+                    tool.name()
+                );
+                match tools::install(host, tool) {
+                    Ok(v) => println!("OK: {} now {v}", tool.name()),
+                    Err(e) => anyhow::bail!("install failed: {e}"),
+                }
+            }
+            _ => {
+                println!("usage: fleetd tools list | tools install <agent> [--host <alias>]");
+            }
+        },
         // --- headless run observability: tail the event stream ---
         Some("watch") => {
-            let run_id = args.get(2).context("usage: fleetd watch <run-id> [--host <alias>] [lines]")?;
+            let run_id = args
+                .get(2)
+                .context("usage: fleetd watch <run-id> [--host <alias>] [lines]")?;
             let host = args
                 .iter()
                 .position(|a| a == "--host")
                 .and_then(|i| args.get(i + 1))
                 .map(String::as_str)
                 .unwrap_or("local");
-            let lines: usize = args
-                .get(3)
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(20);
+            let lines: usize = args.get(3).and_then(|v| v.parse().ok()).unwrap_or(20);
             let kind = args
                 .iter()
                 .position(|a| a == "--agent")
@@ -1205,7 +1309,6 @@ fn main() -> Result<()> {
     }
     Ok(())
 }
-
 
 /// CLI serve path: flags respected (`--port`, `--public`, `--no-scheduler`).
 fn run_serve_cli(args: &[String]) -> Result<()> {

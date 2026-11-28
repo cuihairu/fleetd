@@ -68,7 +68,10 @@ fn run_on(host: &str, cmd: &str) -> std::io::Result<std::process::Output> {
 /// own --version so the number is always the truth on disk.
 pub fn version_on(host: &str, tool: Tool) -> String {
     let name = tool.name();
-    let out = run_on(host, &format!("{name} --version 2>/dev/null || echo missing"));
+    let out = run_on(
+        host,
+        &format!("{name} --version 2>/dev/null || echo missing"),
+    );
     match out {
         Ok(o) if o.status.success() => {
             let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
@@ -103,7 +106,13 @@ pub fn install(host: &str, tool: Tool) -> Result<String, String> {
         return Err(format!(
             "installer exit {:?}: {}",
             out.status.code(),
-            text.chars().rev().take(400).collect::<String>().chars().rev().collect::<String>()
+            text.chars()
+                .rev()
+                .take(400)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect::<String>()
         ));
     }
     Ok(version_on(host, tool))

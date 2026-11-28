@@ -67,10 +67,8 @@ impl Topology {
                 fleet: FleetCfg::default(),
             });
         }
-        let raw = fs::read_to_string(&p)
-            .with_context(|| format!("read {}", p.display()))?;
-        let t: Topology =
-            toml::from_str(&raw).with_context(|| format!("parse {}", p.display()))?;
+        let raw = fs::read_to_string(&p).with_context(|| format!("read {}", p.display()))?;
+        let t: Topology = toml::from_str(&raw).with_context(|| format!("parse {}", p.display()))?;
         let mut t = t;
         if t.ship.name.is_empty() {
             t.ship.name = hostname();
@@ -117,13 +115,24 @@ pub fn pull_ship_ledger(ssh: &str, ship_name: &str) -> Result<PathBuf> {
             .map_err(|e| e.into())
     } else {
         let out = std::process::Command::new("ssh")
-            .args(["-o", "ConnectTimeout=8", "-o", "BatchMode=yes", ssh, "cat", remote_path])
+            .args([
+                "-o",
+                "ConnectTimeout=8",
+                "-o",
+                "BatchMode=yes",
+                ssh,
+                "cat",
+                remote_path,
+            ])
             .output()?;
         if out.status.success() {
             fs::write(&local, &out.stdout)?;
             Ok(())
         } else {
-            bail!("ssh cat failed on {ssh}: {}", String::from_utf8_lossy(&out.stderr).trim())
+            bail!(
+                "ssh cat failed on {ssh}: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )
         }
     };
     status.with_context(|| format!("pull ledger from {ssh}"))?;

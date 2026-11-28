@@ -12,7 +12,11 @@ use store::resources::{upsert, DeviceState, ResourceKind};
 /// Run a probe command locally or over ssh. Returns stdout (trimmed) or None.
 fn probe(host: &str, remote_cmd: &str) -> Option<String> {
     let out = if host == "local" {
-        Command::new("bash").arg("-c").arg(remote_cmd).output().ok()?
+        Command::new("bash")
+            .arg("-c")
+            .arg(remote_cmd)
+            .output()
+            .ok()?
     } else {
         Command::new("ssh")
             .args(["-o", "ConnectTimeout=8", "-o", "BatchMode=yes", host])
@@ -24,7 +28,11 @@ fn probe(host: &str, remote_cmd: &str) -> Option<String> {
         return None;
     }
     let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if s.is_empty() { None } else { Some(s) }
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
 }
 
 /// Known tool probes: (resource name, detection command, detail extractor).
@@ -49,8 +57,22 @@ pub fn probe_tools(c: &rusqlite::Connection, host: &str) -> Result<usize> {
     let mut found = 0;
     for (name, cmd) in TOOL_PROBES {
         if let Some(detail) = probe(host, cmd) {
-            let detail: String = detail.lines().next().unwrap_or("").chars().take(60).collect();
-            upsert(c, ResourceKind::Tool, host, name, &detail, DeviceState::Online, "")?;
+            let detail: String = detail
+                .lines()
+                .next()
+                .unwrap_or("")
+                .chars()
+                .take(60)
+                .collect();
+            upsert(
+                c,
+                ResourceKind::Tool,
+                host,
+                name,
+                &detail,
+                DeviceState::Online,
+                "",
+            )?;
             found += 1;
         }
     }
@@ -75,7 +97,11 @@ pub fn probe_adb_devices(c: &rusqlite::Connection, host: &str) -> Result<usize> 
                 .find(|p| p.starts_with("model:"))
                 .map(|p| p.trim_start_matches("model:"))
                 .unwrap_or("android");
-            let state = if usb_state == "device" { DeviceState::Online } else { DeviceState::Offline };
+            let state = if usb_state == "device" {
+                DeviceState::Online
+            } else {
+                DeviceState::Offline
+            };
             let detail = format!("android {model} ({usb_state})");
             upsert(c, ResourceKind::Device, host, serial, &detail, state, "")?;
             found += 1;
@@ -92,11 +118,23 @@ pub fn probe_host_resources(c: &rusqlite::Connection, host: &str) -> Result<()> 
         Some(s) => s.replace('\n', " · "),
         None => {
             // unreachable or non-linux: record offline honestly
-            upsert(c, ResourceKind::Host, host, host, "unreachable or non-linux probe", DeviceState::Offline, "")?;
+            upsert(
+                c,
+                ResourceKind::Host,
+                host,
+                host,
+                "unreachable or non-linux probe",
+                DeviceState::Offline,
+                "",
+            )?;
             return Ok(());
         }
     };
-    let state = if detail.contains("unreachable") { DeviceState::Offline } else { DeviceState::Online };
+    let state = if detail.contains("unreachable") {
+        DeviceState::Offline
+    } else {
+        DeviceState::Online
+    };
     upsert(c, ResourceKind::Host, host, host, &detail, state, "")
         .map_err(|e| anyhow::anyhow!("upsert host: {e}"))?;
     Ok(())
@@ -139,7 +177,9 @@ mod tests {
         store::resources::init(&c).unwrap();
         // a host alias that cannot exist — ssh fails fast with BatchMode
         probe_host_resources(&c, "nonexistent-host-xyz").unwrap();
-        let rows = store::resources::query(&c, Some(ResourceKind::Host), Some("nonexistent-host-xyz")).unwrap();
+        let rows =
+            store::resources::query(&c, Some(ResourceKind::Host), Some("nonexistent-host-xyz"))
+                .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].state, "offline");
     }

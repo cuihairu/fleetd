@@ -152,8 +152,20 @@ pub fn claude_markers() -> PaneMarkers {
     PaneMarkers {
         busy_footer: &["esc to interrupt ·"],
         spinner: &[
-            "✻", "✽", "✢", "●", "⏵", "Cogitating", "Musing", "Brewed", "Thinking",
-            "Spinning", "Sautéed", "Churned", "Meandering", "Mustering",
+            "✻",
+            "✽",
+            "✢",
+            "●",
+            "⏵",
+            "Cogitating",
+            "Musing",
+            "Brewed",
+            "Thinking",
+            "Spinning",
+            "Sautéed",
+            "Churned",
+            "Meandering",
+            "Mustering",
         ],
         idle_prompt: &["❯"],
     }
@@ -239,7 +251,11 @@ pub struct GenericAgent {
 
 impl GenericAgent {
     pub fn new(kind: AgentKind, markers: PaneMarkers, process_name: &'static str) -> Self {
-        Self { kind, markers, process_name }
+        Self {
+            kind,
+            markers,
+            process_name,
+        }
     }
 }
 
@@ -250,14 +266,20 @@ impl Agent for GenericAgent {
 
     fn probe_load(&self, host: &str, _max: usize) -> Result<Load> {
         let out = if host == "local" {
-            Command::new("pgrep").arg("-c").arg(self.process_name).output()?
+            Command::new("pgrep")
+                .arg("-c")
+                .arg(self.process_name)
+                .output()?
         } else {
             Command::new("ssh")
                 .args(["-o", "ConnectTimeout=8", "-o", "BatchMode=yes", host])
                 .arg(format!("pgrep -c {}", self.process_name))
                 .output()?
         };
-        let running = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap_or(0);
+        let running = String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .unwrap_or(0);
         let reachable = out.status.success() || out.status.code() == Some(1);
         Ok(Load { running, reachable })
     }
@@ -298,11 +320,7 @@ pub fn registry(kind: AgentKind) -> Box<dyn Agent> {
             plain_markers(),
             "opencode",
         )),
-        AgentKind::Pi => Box::new(GenericAgent::new(
-            AgentKind::Pi,
-            plain_markers(),
-            "pi",
-        )),
+        AgentKind::Pi => Box::new(GenericAgent::new(AgentKind::Pi, plain_markers(), "pi")),
         AgentKind::Unknown => Box::new(GenericAgent::new(
             AgentKind::Unknown,
             plain_markers(),

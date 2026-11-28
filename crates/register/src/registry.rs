@@ -48,10 +48,11 @@ pub fn alive_since(minutes: i64) -> Result<Vec<(String, i64)>> {
         .unwrap_or_default()
         .as_secs() as i64)
         - minutes * 60;
-    let mut stmt = c.prepare(
-        "SELECT seat, last_seen FROM agent_seen WHERE last_seen > ?1 ORDER BY seat",
-    )?;
-    let rows = stmt.query_map([cutoff], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+    let mut stmt =
+        c.prepare("SELECT seat, last_seen FROM agent_seen WHERE last_seen > ?1 ORDER BY seat")?;
+    let rows = stmt.query_map([cutoff], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+    })?;
     let mut out = Vec::new();
     for r in rows {
         out.push(r?);
@@ -63,7 +64,10 @@ pub fn alive_since(minutes: i64) -> Result<Vec<(String, i64)>> {
 /// handed out (registration center owns the counter, forward only consumes).
 pub fn bump_pulls(seat: &str) -> Result<()> {
     let c = db()?;
-    c.execute("UPDATE agent_seen SET pulls = pulls + 1 WHERE seat = ?1", [seat])
-        .with_context(|| "bump pulls")?;
+    c.execute(
+        "UPDATE agent_seen SET pulls = pulls + 1 WHERE seat = ?1",
+        [seat],
+    )
+    .with_context(|| "bump pulls")?;
     Ok(())
 }

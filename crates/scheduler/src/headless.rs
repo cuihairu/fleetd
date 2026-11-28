@@ -85,7 +85,12 @@ fn sh_quote(s: &str) -> String {
 /// goes to background as one job. Terminal state comes from the event
 /// stream (see poll_state), not from a process exit code — the spawner
 /// returns immediately.
-pub fn remote_launch_cmd(kind: &str, run_id: &str, task_file: &str, permission_mode: &str) -> String {
+pub fn remote_launch_cmd(
+    kind: &str,
+    run_id: &str,
+    task_file: &str,
+    permission_mode: &str,
+) -> String {
     let dir = format!("{RUN_DIR}/{run_id}");
     let spec = spec_for(kind).unwrap_or_else(|| &SPECS[0]);
     spec.launch_cmd
@@ -95,7 +100,13 @@ pub fn remote_launch_cmd(kind: &str, run_id: &str, task_file: &str, permission_m
 }
 
 /// Spawn the headless run on `host` over SSH (or locally when host == "local").
-pub fn launch(host: &str, kind: &str, run_id: &str, task_file: &str, permission_mode: &str) -> std::io::Result<()> {
+pub fn launch(
+    host: &str,
+    kind: &str,
+    run_id: &str,
+    task_file: &str,
+    permission_mode: &str,
+) -> std::io::Result<()> {
     let cmd = remote_launch_cmd(kind, run_id, task_file, permission_mode);
     if host == "local" {
         Command::new("bash").arg("-c").arg(&cmd).spawn()?;
@@ -112,7 +123,9 @@ pub fn launch(host: &str, kind: &str, run_id: &str, task_file: &str, permission_
 fn stream_head(host: &str, run_id: &str, bytes: usize) -> String {
     let path = format!("{RUN_DIR}/{run_id}/stream.jsonl");
     let out = if host == "local" {
-        Command::new("head").args(["-c", &bytes.to_string(), &path]).output()
+        Command::new("head")
+            .args(["-c", &bytes.to_string(), &path])
+            .output()
     } else {
         Command::new("ssh")
             .args(["-o", "ConnectTimeout=8", "-o", "BatchMode=yes", host])
@@ -170,7 +183,11 @@ pub fn poll_state_quiet(host: &str, kind: &str, run_id: &str, quiet_secs: u64) -
             return RunState::Finished("error".into());
         }
         if !spec.ok_marker.is_empty() && line.contains(spec.ok_marker) {
-            let sub = if line.contains("\"subtype\":\"success\"") { "success" } else { "error" };
+            let sub = if line.contains("\"subtype\":\"success\"") {
+                "success"
+            } else {
+                "error"
+            };
             return RunState::Finished(sub.into());
         }
     }
@@ -196,7 +213,9 @@ pub fn poll_state_quiet(host: &str, kind: &str, run_id: &str, quiet_secs: u64) -
 pub fn tail(host: &str, run_id: &str, n: usize) -> String {
     let path = format!("{RUN_DIR}/{run_id}/stream.jsonl");
     let out = if host == "local" {
-        Command::new("tail").args(["-n", &n.to_string(), &path]).output()
+        Command::new("tail")
+            .args(["-n", &n.to_string(), &path])
+            .output()
     } else {
         Command::new("ssh")
             .args(["-o", "ConnectTimeout=8", "-o", "BatchMode=yes", host])

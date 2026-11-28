@@ -13,7 +13,7 @@
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::{ServiceExt, tool, tool_handler, tool_router, ServerHandler};
+use rmcp::{tool, tool_handler, tool_router, ServerHandler, ServiceExt};
 use serde::Deserialize;
 
 /// Tools exposed to agents.
@@ -198,7 +198,9 @@ impl FleetMcp {
             .unwrap_or_default();
         let mut out = String::from("name | runs | ok | avg_sec | last\n");
         for (name, runs, ok, avg, last) in rows {
-            let t = fleetd_core::schedule::ts(last).format("%m-%d %H:%M").to_string();
+            let t = fleetd_core::schedule::ts(last)
+                .format("%m-%d %H:%M")
+                .to_string();
             out.push_str(&format!("{name} | {runs} | {ok} | {avg} | {t}\n"));
         }
         out

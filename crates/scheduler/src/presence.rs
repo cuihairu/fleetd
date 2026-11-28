@@ -135,4 +135,3 @@ mod tests {
         assert_eq!((open, blocked), (0, 0));
     }
 }
-

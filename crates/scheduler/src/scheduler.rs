@@ -12,11 +12,18 @@
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Datelike, Local, Timelike};
 
-pub use fleetd_core::schedule::{parse_schedule, is_due, ts, Schedule};
+pub use fleetd_core::schedule::{is_due, parse_schedule, ts, Schedule};
 
 pub fn run_command(command: &str) -> Result<(i32, String)> {
     let finish = |code: i32, text: &str| -> Result<(i32, String)> {
-        let tail: String = text.chars().rev().take(2000).collect::<Vec<_>>().into_iter().rev().collect();
+        let tail: String = text
+            .chars()
+            .rev()
+            .take(2000)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
         Ok((code, tail))
     };
 
@@ -29,9 +36,15 @@ pub fn run_command(command: &str) -> Result<(i32, String)> {
             impl crate::pyhost::FleetdApi for NoopApi {
                 fn log(&self, _m: &str) {}
                 fn alert(&self, _m: &str) {}
-                fn seats(&self) -> Vec<(String, String)> { Vec::new() }
-                fn jobs(&self) -> Vec<(String, String, bool)> { Vec::new() }
-                fn run_job(&self, _name: &str) -> anyhow::Result<i32> { Ok(0) }
+                fn seats(&self) -> Vec<(String, String)> {
+                    Vec::new()
+                }
+                fn jobs(&self) -> Vec<(String, String, bool)> {
+                    Vec::new()
+                }
+                fn run_job(&self, _name: &str) -> anyhow::Result<i32> {
+                    Ok(0)
+                }
             }
             let init_result = crate::pyhost::init(Box::new(NoopApi));
             if let Err(e) = &init_result {
@@ -66,7 +79,10 @@ pub fn run_command(command: &str) -> Result<(i32, String)> {
         }
     } else {
         use std::process::Command;
-        let output = Command::new("bash").arg("-c").arg(command).output()
+        let output = Command::new("bash")
+            .arg("-c")
+            .arg(command)
+            .output()
             .with_context(|| "spawn job command")?;
         let mut text = String::new();
         text.push_str(&String::from_utf8_lossy(&output.stdout));
@@ -90,9 +106,15 @@ where
         impl crate::pyhost::FleetdApi for NoopApi {
             fn log(&self, _m: &str) {}
             fn alert(&self, _m: &str) {}
-            fn seats(&self) -> Vec<(String, String)> { Vec::new() }
-            fn jobs(&self) -> Vec<(String, String, bool)> { Vec::new() }
-            fn run_job(&self, _name: &str) -> anyhow::Result<i32> { Ok(0) }
+            fn seats(&self) -> Vec<(String, String)> {
+                Vec::new()
+            }
+            fn jobs(&self) -> Vec<(String, String, bool)> {
+                Vec::new()
+            }
+            fn run_job(&self, _name: &str) -> anyhow::Result<i32> {
+                Ok(0)
+            }
         }
         let _ = crate::pyhost::init(Box::new(NoopApi));
     }
@@ -113,9 +135,18 @@ mod tests {
 
     #[test]
     fn parses_cron_and_interval() {
-        assert!(matches!(parse_schedule("*/5 * * * *").unwrap(), Schedule::Cron(_)));
-        assert_eq!(parse_schedule("every 15m").unwrap(), Schedule::Interval { minutes: 15 });
-        assert_eq!(parse_schedule("@every 2h").unwrap(), Schedule::Interval { minutes: 120 });
+        assert!(matches!(
+            parse_schedule("*/5 * * * *").unwrap(),
+            Schedule::Cron(_)
+        ));
+        assert_eq!(
+            parse_schedule("every 15m").unwrap(),
+            Schedule::Interval { minutes: 15 }
+        );
+        assert_eq!(
+            parse_schedule("@every 2h").unwrap(),
+            Schedule::Interval { minutes: 120 }
+        );
         assert!(parse_schedule("bogus").is_err());
         assert!(parse_schedule("* * * *").is_err());
     }
@@ -185,13 +216,23 @@ mod pyjob_tests {
         impl crate::pyhost::FleetdApi for NoopApi {
             fn log(&self, _m: &str) {}
             fn alert(&self, _m: &str) {}
-            fn seats(&self) -> Vec<(String, String)> { Vec::new() }
-            fn jobs(&self) -> Vec<(String, String, bool)> { Vec::new() }
-            fn run_job(&self, _name: &str) -> anyhow::Result<i32> { Ok(0) }
+            fn seats(&self) -> Vec<(String, String)> {
+                Vec::new()
+            }
+            fn jobs(&self) -> Vec<(String, String, bool)> {
+                Vec::new()
+            }
+            fn run_job(&self, _name: &str) -> anyhow::Result<i32> {
+                Ok(0)
+            }
         }
         let _ = crate::pyhost::init(Box::new(NoopApi));
         let path = std::env::temp_dir().join("fleetd-e2e-pyjob.py");
-        std::fs::write(&path, "import fleetd\nprint('e2e-ok', hasattr(fleetd,'seats'))").unwrap();
+        std::fs::write(
+            &path,
+            "import fleetd\nprint('e2e-ok', hasattr(fleetd,'seats'))",
+        )
+        .unwrap();
         let (code, out) = super::run_command(path.to_str().unwrap()).unwrap();
         assert_eq!(code, 0, "py job failed: {out}");
         assert!(out.contains("e2e-ok True"), "stdout: {out}");

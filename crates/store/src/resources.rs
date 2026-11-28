@@ -146,27 +146,29 @@ pub fn query(
     )?;
     let kind_s = kind.map(|k| k.as_str().to_string());
     let rows = st
-        .query_map(
-            rusqlite::params![kind_s.as_deref(), host],
-            |r| {
-                Ok(ResourceRow {
-                    kind: r.get(0)?,
-                    host: r.get(1)?,
-                    name: r.get(2)?,
-                    detail: r.get(3)?,
-                    state: r.get(4)?,
-                    holder: r.get(5)?,
-                    updated_at: r.get(6)?,
-                })
-            },
-        )?
+        .query_map(rusqlite::params![kind_s.as_deref(), host], |r| {
+            Ok(ResourceRow {
+                kind: r.get(0)?,
+                host: r.get(1)?,
+                name: r.get(2)?,
+                detail: r.get(3)?,
+                state: r.get(4)?,
+                holder: r.get(5)?,
+                updated_at: r.get(6)?,
+            })
+        })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
 }
 
 /// Claim a device (set busy + holder) only when it is online and free.
 /// Returns false when the device is busy/offline/missing — caller must not proceed.
-pub fn claim_device(c: &Connection, host: &str, name: &str, holder: &str) -> Result<bool, rusqlite::Error> {
+pub fn claim_device(
+    c: &Connection,
+    host: &str,
+    name: &str,
+    holder: &str,
+) -> Result<bool, rusqlite::Error> {
     let n = c.execute(
         "UPDATE resources SET state='busy', holder=?1, updated_at=?2
          WHERE kind='device' AND host=?3 AND name=?4 AND state='online'",
@@ -198,9 +200,36 @@ mod tests {
     #[test]
     fn upsert_and_query() {
         let c = mem();
-        upsert(&c, ResourceKind::Tool, "openclaw", "cargo", "1.88", DeviceState::Online, "").unwrap();
-        upsert(&c, ResourceKind::Tool, "openclaw", "node", "22.23", DeviceState::Online, "").unwrap();
-        upsert(&c, ResourceKind::Tool, "imac", "dotnet", "8.0", DeviceState::Online, "").unwrap();
+        upsert(
+            &c,
+            ResourceKind::Tool,
+            "openclaw",
+            "cargo",
+            "1.88",
+            DeviceState::Online,
+            "",
+        )
+        .unwrap();
+        upsert(
+            &c,
+            ResourceKind::Tool,
+            "openclaw",
+            "node",
+            "22.23",
+            DeviceState::Online,
+            "",
+        )
+        .unwrap();
+        upsert(
+            &c,
+            ResourceKind::Tool,
+            "imac",
+            "dotnet",
+            "8.0",
+            DeviceState::Online,
+            "",
+        )
+        .unwrap();
         let all = query(&c, Some(ResourceKind::Tool), None).unwrap();
         assert_eq!(all.len(), 3);
         let oncl = query(&c, Some(ResourceKind::Tool), Some("openclaw")).unwrap();
@@ -210,8 +239,26 @@ mod tests {
     #[test]
     fn upsert_overwrites_detail() {
         let c = mem();
-        upsert(&c, ResourceKind::Tool, "local", "adb", "34.0", DeviceState::Online, "").unwrap();
-        upsert(&c, ResourceKind::Tool, "local", "adb", "35.0", DeviceState::Online, "").unwrap();
+        upsert(
+            &c,
+            ResourceKind::Tool,
+            "local",
+            "adb",
+            "34.0",
+            DeviceState::Online,
+            "",
+        )
+        .unwrap();
+        upsert(
+            &c,
+            ResourceKind::Tool,
+            "local",
+            "adb",
+            "35.0",
+            DeviceState::Online,
+            "",
+        )
+        .unwrap();
         let rows = query(&c, Some(ResourceKind::Tool), Some("local")).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].detail, "35.0");
@@ -220,7 +267,16 @@ mod tests {
     #[test]
     fn claim_only_when_online_and_free() {
         let c = mem();
-        upsert(&c, ResourceKind::Device, "local", "adb-emu-5554", "pixel8 api34", DeviceState::Online, "").unwrap();
+        upsert(
+            &c,
+            ResourceKind::Device,
+            "local",
+            "adb-emu-5554",
+            "pixel8 api34",
+            DeviceState::Online,
+            "",
+        )
+        .unwrap();
         // first claim wins
         assert!(claim_device(&c, "local", "adb-emu-5554", "kode").unwrap());
         // second claim on busy fails
@@ -242,7 +298,16 @@ mod tests {
     #[test]
     fn release_is_idempotent() {
         let c = mem();
-        upsert(&c, ResourceKind::Device, "imac", "win11-box", "22h2", DeviceState::Online, "").unwrap();
+        upsert(
+            &c,
+            ResourceKind::Device,
+            "imac",
+            "win11-box",
+            "22h2",
+            DeviceState::Online,
+            "",
+        )
+        .unwrap();
         assert!(release_device(&c, "imac", "win11-box").unwrap());
         // releasing again still "succeeds" (already online) — idempotent
         assert!(release_device(&c, "imac", "win11-box").unwrap());

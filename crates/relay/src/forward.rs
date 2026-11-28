@@ -13,8 +13,6 @@ pub struct PullDispatch {
     pub repo: String,
 }
 
-
-
 /// Oldest pending pull task for `seat`, if any (consumed on handout).
 pub(crate) fn pending_pull(c: &Connection, seat: &str) -> Result<Option<PullDispatch>> {
     let mut stmt = c.prepare(
@@ -64,7 +62,13 @@ pub fn queue_pull(seat: &str, task_file: &str, repo: &str) -> Result<i64> {
     c.execute(
         "INSERT INTO tasks(id,host,repo,task_file,state,created_at)
          VALUES(?1,?2,?3,?4,'pending-pull',?5)",
-        rusqlite::params![format!("pull-{}-{now}", uuid_lite()), seat, repo, task_file, now],
+        rusqlite::params![
+            format!("pull-{}-{now}", uuid_lite()),
+            seat,
+            repo,
+            task_file,
+            now
+        ],
     )
     .with_context(|| "queue pull task")?;
     Ok(c.last_insert_rowid())

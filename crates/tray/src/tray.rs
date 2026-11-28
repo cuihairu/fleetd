@@ -31,12 +31,11 @@ use windows_sys::Win32::UI::Shell::{
     NOTIFYICONDATAW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
-    DestroyIcon, DestroyMenu, DispatchMessageW, GetMessageW, GetCursorPos, KillTimer,
-    PostQuitMessage, RegisterClassExW, SetForegroundWindow, SetTimer, TrackPopupMenu,
-    TranslateMessage, HICON, HMENU, ICONINFO, MF_DISABLED, MF_SEPARATOR, MF_STRING, MSG,
-    TPM_BOTTOMALIGN, TPM_RIGHTBUTTON, WNDCLASSEXW, WM_COMMAND, WM_DESTROY, WM_RBUTTONUP,
-    WM_TIMER,
+    AppendMenuW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon,
+    DestroyMenu, DispatchMessageW, GetCursorPos, GetMessageW, KillTimer, PostQuitMessage,
+    RegisterClassExW, SetForegroundWindow, SetTimer, TrackPopupMenu, TranslateMessage, HICON,
+    HMENU, ICONINFO, MF_DISABLED, MF_SEPARATOR, MF_STRING, MSG, TPM_BOTTOMALIGN, TPM_RIGHTBUTTON,
+    WM_COMMAND, WM_DESTROY, WM_RBUTTONUP, WM_TIMER, WNDCLASSEXW,
 };
 
 const WIDTH: u32 = 64;
@@ -121,8 +120,7 @@ fn open_panel() {
 }
 
 fn flagship_base() -> String {
-    std::env::var("FLEETD_STATUS_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:3790/v1/status".into())
+    std::env::var("FLEETD_STATUS_URL").unwrap_or_else(|_| "http://127.0.0.1:3790/v1/status".into())
 }
 
 /// GET /v1/status → in_flight count; any failure = 0 (idle).
@@ -160,16 +158,16 @@ fn url_port(url: &str) -> Option<String> {
 fn fetch_status_field(field: &str) -> Option<String> {
     use std::io::{Read as _, Write as _};
 
-    let path = std::env::var("FLEETD_STATUS_SOCK")
-        .unwrap_or_else(|_| {
-            let home = std::env::var("USERPROFILE")
-                .or_else(|_| std::env::var("HOME"))
-                .unwrap_or_else(|_| ".".into());
-            format!("{home}\\.fleetd\\flagship.sock")
-        });
+    let path = std::env::var("FLEETD_STATUS_SOCK").unwrap_or_else(|_| {
+        let home = std::env::var("USERPROFILE")
+            .or_else(|_| std::env::var("HOME"))
+            .unwrap_or_else(|_| ".".into());
+        format!("{home}\\.fleetd\\flagship.sock")
+    });
     let mut stream = uds::UnixStream::connect(path).ok()?;
     let _ = stream.write_all(
-        format!("GET /v1/status HTTP/1.1\r\nHost: flagship\r\nConnection: close\r\n\r\n").as_bytes(),
+        format!("GET /v1/status HTTP/1.1\r\nHost: flagship\r\nConnection: close\r\n\r\n")
+            .as_bytes(),
     );
     let mut body = Vec::new();
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));

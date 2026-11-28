@@ -15,11 +15,19 @@ pub enum Schedule {
 pub fn parse_schedule(s: &str) -> Result<Schedule> {
     let t = s.trim();
     let lower = t.to_ascii_lowercase();
-    if let Some(rest) = lower.strip_prefix("every ").or_else(|| lower.strip_prefix("@every ")) {
+    if let Some(rest) = lower
+        .strip_prefix("every ")
+        .or_else(|| lower.strip_prefix("@every "))
+    {
         let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-        let unit: String = rest[digits.len()..].chars().take_while(|c| c.is_ascii_alphabetic()).collect();
+        let unit: String = rest[digits.len()..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphabetic())
+            .collect();
         let n: i64 = digits.parse().context("interval must include a number")?;
-        if n <= 0 { bail!("interval must be > 0"); }
+        if n <= 0 {
+            bail!("interval must be > 0");
+        }
         let minutes = match unit.as_str() {
             "s" | "sec" | "secs" => (n + 59) / 60,
             "m" | "min" | "mins" | "" => n,
@@ -54,8 +62,14 @@ fn validate_field(field: &str, index: usize) -> Result<()> {
             Some((b, s)) => (b, Some(s.parse::<u32>().context("bad step")?)),
             None => (part, None),
         };
-        if let Some(s) = step { if s == 0 { bail!("step must be > 0"); } }
-        if base == "*" { continue; }
+        if let Some(s) = step {
+            if s == 0 {
+                bail!("step must be > 0");
+            }
+        }
+        if base == "*" {
+            continue;
+        }
         let (a, b) = match base.split_once('-') {
             Some((x, y)) => (x.parse::<u32>()?, y.parse::<u32>()?),
             None => (base.parse::<u32>()?, base.parse::<u32>()?),
@@ -89,7 +103,11 @@ fn field_matches(field: &str, value: u32) -> bool {
 }
 
 /// Is this schedule due at time `now`, given the last run time?
-pub fn is_due(schedule: &Schedule, now: &DateTime<Local>, last_run: Option<&DateTime<Local>>) -> bool {
+pub fn is_due(
+    schedule: &Schedule,
+    now: &DateTime<Local>,
+    last_run: Option<&DateTime<Local>>,
+) -> bool {
     match schedule {
         Schedule::Interval { minutes } => match last_run {
             None => true,
@@ -97,7 +115,9 @@ pub fn is_due(schedule: &Schedule, now: &DateTime<Local>, last_run: Option<&Date
         },
         Schedule::Cron(expr) => {
             let f: Vec<&str> = expr.split_whitespace().collect();
-            if f.len() != 5 { return false; }
+            if f.len() != 5 {
+                return false;
+            }
             // avoid running twice in the same minute
             if let Some(last) = last_run {
                 if last.format("%Y-%m-%d %H:%M").to_string()
@@ -115,7 +135,8 @@ pub fn is_due(schedule: &Schedule, now: &DateTime<Local>, last_run: Option<&Date
                 && field_matches(f[1], hour)
                 && field_matches(f[2], day)
                 && field_matches(f[3], month)
-                && (field_matches(f[4], weekday) || field_matches(f[4], if weekday == 0 { 7 } else { weekday }))
+                && (field_matches(f[4], weekday)
+                    || field_matches(f[4], if weekday == 0 { 7 } else { weekday }))
         }
     }
 }

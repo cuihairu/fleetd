@@ -6,6 +6,6 @@
 pub mod scm_service;
 pub mod service;
 
-pub use service::{detect, launchd_plist, systemd_unit, windows_commands, Platform};
 #[cfg(windows)]
 pub use scm_service::run;
+pub use service::{detect, launchd_plist, systemd_unit, windows_commands, Platform};

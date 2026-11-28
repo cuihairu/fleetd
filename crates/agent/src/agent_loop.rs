@@ -35,7 +35,11 @@ fn default_interval() -> u64 {
     30
 }
 
-pub fn load_or_init(flagship: Option<&str>, token: Option<&str>, seat: Option<&str>) -> Result<AgentConfig> {
+pub fn load_or_init(
+    flagship: Option<&str>,
+    token: Option<&str>,
+    seat: Option<&str>,
+) -> Result<AgentConfig> {
     let home = store::ledger::home_dir();
     let conf_path = std::path::Path::new(&home).join(AGENT_CONF);
     load_from(&conf_path, flagship, token, seat)
@@ -55,7 +59,9 @@ pub fn load_from(
     let cfg = AgentConfig {
         flagship: flagship_field
             .or_else(|| saved.as_ref().map(|c| c.flagship.clone()))
-            .context("flagship url required (first run): fleetd agent --flagship http://host:3790")?,
+            .context(
+                "flagship url required (first run): fleetd agent --flagship http://host:3790",
+            )?,
         token: token
             .map(String::from)
             .or_else(|| saved.as_ref().map(|c| c.token.clone()))
@@ -160,7 +166,13 @@ pub fn run_loop(cfg: AgentConfig, workdir: &str, permission_mode: &str) -> Resul
     loop {
         match beat(&cfg, workdir) {
             Some((id, task_text, repo)) => {
-                let _ = writeln!(lock, "[{}] dispatch {}: {} chars", now(), id, task_text.len());
+                let _ = writeln!(
+                    lock,
+                    "[{}] dispatch {}: {} chars",
+                    now(),
+                    id,
+                    task_text.len()
+                );
                 let _ = lock.flush();
                 // Materialize the task and launch headless claude (fire and
                 // forget with setsid; the flagship sees progress via git head on
@@ -212,7 +224,13 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("fleetd-agent-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let conf = dir.join(".fleetd/agent.toml");
-        let cfg = load_from(&conf, Some("http://flagship:3790"), Some("tok"), Some("ship-a")).unwrap();
+        let cfg = load_from(
+            &conf,
+            Some("http://flagship:3790"),
+            Some("tok"),
+            Some("ship-a"),
+        )
+        .unwrap();
         assert_eq!(cfg.seat, "ship-a");
         let saved = std::fs::read_to_string(&conf).unwrap();
         assert!(saved.contains("http://flagship:3790"));

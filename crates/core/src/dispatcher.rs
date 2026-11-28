@@ -38,13 +38,19 @@ pub fn decide(
     agent_busy: bool,
 ) -> Decision {
     if !auto_enabled {
-        return Decision::Noop { reason: "auto-dispatch disabled (noauto flag)".into() };
+        return Decision::Noop {
+            reason: "auto-dispatch disabled (noauto flag)".into(),
+        };
     }
     if !cooldown_ok {
-        return Decision::Noop { reason: "cooldown: last dispatch too recent".into() };
+        return Decision::Noop {
+            reason: "cooldown: last dispatch too recent".into(),
+        };
     }
     if agent_busy {
-        return Decision::Noop { reason: "agent is busy; never stack a second task".into() };
+        return Decision::Noop {
+            reason: "agent is busy; never stack a second task".into(),
+        };
     }
     let actionable = (open - blocked.max(0)).max(0);
     match verdict {
@@ -54,7 +60,9 @@ pub fn decide(
             _ if blocked > 0 => Decision::Noop {
                 reason: format!("all {blocked} remaining todo(s) blocked; waiting on user"),
             },
-            _ => Decision::Noop { reason: "completed and no open todos".into() },
+            _ => Decision::Noop {
+                reason: "completed and no open todos".into(),
+            },
         },
         Verdict::Partial | Verdict::Stalled => Decision::Resume {
             dirty,
@@ -87,7 +95,12 @@ pub fn task_text(d: &Decision, seat: &str) -> Option<String> {
 }
 
 /// Safety gates before any execution. Pure — unit-tested.
-pub fn gates_pass(noauto_global: bool, noauto_seat: bool, agent_busy: bool, cooldown_ok: bool) -> Result<(), String> {
+pub fn gates_pass(
+    noauto_global: bool,
+    noauto_seat: bool,
+    agent_busy: bool,
+    cooldown_ok: bool,
+) -> Result<(), String> {
     if noauto_global {
         return Err("global kill-switch (noauto-nudge/ALL) is set".into());
     }
@@ -118,7 +131,11 @@ pub fn execute(
     let kind = agent_for(agent_spec);
     let agent = crate::agent::registry(kind);
     match agent.dispatch(host, seat, &text) {
-        Delivery::Delivered => Ok(format!("delivered via {}: {}", kind.as_str(), shrink(&text))),
+        Delivery::Delivered => Ok(format!(
+            "delivered via {}: {}",
+            kind.as_str(),
+            shrink(&text)
+        )),
         Delivery::NoSession => Err(format!("{} session missing on {host}", seat)),
         Delivery::NotDelivered => Err(format!("{} did not acknowledge on {host}", seat)),
     }
@@ -138,8 +155,22 @@ mod tests {
 
     #[test]
     fn completed_with_queue_dispatches() {
-        let d = decide(Verdict::Completed, 10, 0, Some("t-001".into()), 0, true, true, false);
-        assert_eq!(d, Decision::DispatchQueued { tag: "t-001".into() });
+        let d = decide(
+            Verdict::Completed,
+            10,
+            0,
+            Some("t-001".into()),
+            0,
+            true,
+            true,
+            false,
+        );
+        assert_eq!(
+            d,
+            Decision::DispatchQueued {
+                tag: "t-001".into()
+            }
+        );
     }
 
     #[test]
@@ -156,7 +187,16 @@ mod tests {
 
     #[test]
     fn stalled_sends_resume_not_original_task() {
-        let d = decide(Verdict::Stalled, 9, 0, Some("t-001".into()), 3, true, true, false);
+        let d = decide(
+            Verdict::Stalled,
+            9,
+            0,
+            Some("t-001".into()),
+            3,
+            true,
+            true,
+            false,
+        );
         assert!(matches!(d, Decision::Resume { dirty: 3, .. }));
     }
 
@@ -174,19 +214,46 @@ mod tests {
 
     #[test]
     fn disabled_never_dispatches() {
-        let d = decide(Verdict::Completed, 9, 0, Some("t".into()), 0, false, true, false);
+        let d = decide(
+            Verdict::Completed,
+            9,
+            0,
+            Some("t".into()),
+            0,
+            false,
+            true,
+            false,
+        );
         assert!(matches!(d, Decision::Noop { .. }));
     }
 
     #[test]
     fn cooldown_blocks() {
-        let d = decide(Verdict::Completed, 9, 0, Some("t".into()), 0, true, false, false);
+        let d = decide(
+            Verdict::Completed,
+            9,
+            0,
+            Some("t".into()),
+            0,
+            true,
+            false,
+            false,
+        );
         assert!(matches!(d, Decision::Noop { .. }));
     }
 
     #[test]
     fn busy_never_stacks() {
-        let d = decide(Verdict::Completed, 9, 0, Some("t".into()), 0, true, true, true);
+        let d = decide(
+            Verdict::Completed,
+            9,
+            0,
+            Some("t".into()),
+            0,
+            true,
+            true,
+            true,
+        );
         assert!(matches!(d, Decision::Noop { .. }));
     }
 
@@ -207,13 +274,30 @@ mod tests {
 
     #[test]
     fn queued_tag_still_dispatches_despite_blocked() {
-        let d = decide(Verdict::Completed, 0, 5, Some("t-001".into()), 0, true, true, false);
-        assert_eq!(d, Decision::DispatchQueued { tag: "t-001".into() });
+        let d = decide(
+            Verdict::Completed,
+            0,
+            5,
+            Some("t-001".into()),
+            0,
+            true,
+            true,
+            false,
+        );
+        assert_eq!(
+            d,
+            Decision::DispatchQueued {
+                tag: "t-001".into()
+            }
+        );
     }
 
     #[test]
     fn resume_text_has_progress_hint() {
-        let d = Decision::Resume { dirty: 3, reason: "stalled".into() };
+        let d = Decision::Resume {
+            dirty: 3,
+            reason: "stalled".into(),
+        };
         let t = task_text(&d, "kode").unwrap();
         assert!(t.contains("git status"));
         assert!(t.contains("3"));

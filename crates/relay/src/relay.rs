@@ -2,8 +2,8 @@
 //! 登记 + forward 取件)。登记细节在 fleetd-register,队列细节在 forward。
 
 use crate::forward::{pending_pull, PullDispatch};
-use register::registry::record_heartbeat;
 use anyhow::{Context, Result};
+use register::registry::record_heartbeat;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize)]
@@ -24,8 +24,7 @@ pub struct HeartbeatReply {
 
 /// Handle one heartbeat: record liveness, hand back the pending dispatch.
 pub fn heartbeat(raw: &str) -> Result<HeartbeatReply> {
-    let hb: Heartbeat =
-        serde_json::from_str(raw).with_context(|| "parse heartbeat JSON")?;
+    let hb: Heartbeat = serde_json::from_str(raw).with_context(|| "parse heartbeat JSON")?;
     if hb.seat.is_empty() || hb.seat.contains('/') {
         anyhow::bail!("invalid seat name");
     }
@@ -38,4 +37,3 @@ pub fn heartbeat(raw: &str) -> Result<HeartbeatReply> {
 }
 
 pub use register::alive_since;
-

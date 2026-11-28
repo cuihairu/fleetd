@@ -41,10 +41,7 @@ fn render(json: &str, now: i64) -> Result<String, String> {
         "{BOLD}FLEET OVERVIEW{RESET}  open={}\n",
         v["open_count"].as_i64().unwrap_or(0),
     ));
-    out.push_str(&format!(
-        "{DIM}{}{RESET}\n",
-        "-".repeat(66)
-    ));
+    out.push_str(&format!("{DIM}{}{RESET}\n", "-".repeat(66)));
     out.push_str(&format!(
         "{BOLD}{:<14} {:<22} {:<10} {:>8}{RESET}\n",
         "SEAT", "TASK", "STATE", "AGE"
@@ -123,7 +120,13 @@ pub fn run(flagship: &str, follow: bool) -> Result<(), String> {
     let url = format!("{}/v1/fleet/summary", flagship.trim_end_matches('/'));
     loop {
         let rendered = match http_get(&url) {
-            Ok(j) => render(&j, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64)?,
+            Ok(j) => render(
+                &j,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64,
+            )?,
             Err(e) => format!("{RED}flagship unreachable: {e}{RESET}"),
         };
         if follow {

@@ -14,7 +14,6 @@
 //
 // Uninstall mirrors install (remove the definition + stop).
 
-
 pub enum Platform {
     Linux,
     Windows,
@@ -83,9 +82,7 @@ pub fn windows_commands(exe: &str) -> Vec<String> {
             r#"sc create FleetD binPath= "\"{exe}\" serve" start= auto DisplayName= "fleetd flagship service""#,
             exe = exe
         ),
-        format!(
-            r#"sc failure FleetD reset= 86400 actions= restart/5000"#
-        ),
+        format!(r#"sc failure FleetD reset= 86400 actions= restart/5000"#),
         format!(
             r#"schtasks /Create /F /SC ONLOGON /TN FleetDTray /RL HIGHEST /TR "\"{exe}\" tray""#,
             exe = exe

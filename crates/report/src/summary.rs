@@ -40,9 +40,7 @@ pub fn build(days: u64) -> Result<Summary, String> {
         let mut stmt = c
             .prepare("SELECT seat, status, current_tag, updated_at FROM seats ORDER BY seat")
             .map_err(|e| e.to_string())?;
-        let mut rows = stmt
-            .query([])
-            .map_err(|e| e.to_string())?;
+        let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
         while let Some(r) = rows.next().map_err(|e| e.to_string())? {
             seats.push(SeatRow {
                 seat: r.get(0).map_err(|e| e.to_string())?,

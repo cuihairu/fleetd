@@ -132,7 +132,8 @@ fn fleetd_jobs() -> Vec<(String, String, bool)> {
 
 #[pyfunction(name = "run_job")]
 fn fleetd_run_job(name: &str) -> PyResult<i32> {
-    api().run_job(name)
+    api()
+        .run_job(name)
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
 }
 
@@ -215,13 +216,19 @@ mod tests {
         init(Box::new(Shared(logs.clone()))).unwrap();
         let out = run_source("import fleetd\nfleetd.log('hi')\nprint('py-ok')").unwrap();
         assert_eq!(out.trim(), "py-ok");
-        assert!(logs.load(Ordering::SeqCst) >= 1, "hook must cross the FFI boundary");
+        assert!(
+            logs.load(Ordering::SeqCst) >= 1,
+            "hook must cross the FFI boundary"
+        );
     }
 
     #[test]
     fn seat_list_round_trips() {
         use std::sync::atomic::AtomicUsize;
-        init(Box::new(StubApi { logs: AtomicUsize::new(0) })).unwrap();
+        init(Box::new(StubApi {
+            logs: AtomicUsize::new(0),
+        }))
+        .unwrap();
         let out = run_source("import fleetd\nprint(fleetd.seats())").unwrap();
         assert!(out.contains("coding"), "seats visible from python: {out}");
     }

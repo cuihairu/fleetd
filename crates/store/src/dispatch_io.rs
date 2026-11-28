@@ -38,7 +38,9 @@ pub fn run(
 
     gates_pass(global_flag, seat_flag, agent_busy, cooldown_ok)?;
 
-    let decision = decide(verdict, open, blocked, queued_tag, dirty, auto, true, agent_busy);
+    let decision = decide(
+        verdict, open, blocked, queued_tag, dirty, auto, true, agent_busy,
+    );
     if let Decision::Noop { reason } = &decision {
         return Ok(format!("noop: {reason}"));
     }
@@ -68,7 +70,9 @@ pub fn run(
 
 /// Cooldown check: true when no dispatch for this seat in the last `secs`.
 fn cooldown_ok(seat: &str, secs: i64) -> bool {
-    let Ok(c) = crate::ledger::open() else { return false };
+    let Ok(c) = crate::ledger::open() else {
+        return false;
+    };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
