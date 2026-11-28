@@ -325,15 +325,22 @@ pub fn update_remote_windows(host: &str, restart: bool) -> Result<(String, Strin
         "scp -o BatchMode=yes {}/tray.exe {host}:C:/Users/cui/.fleetd/fleetd-tray.exe.new",
         tmp.display()
     ));
+    // Swap via Copy-Item -Force, NOT Move-Item: Windows PowerShell 5.1
+    // refuses to Move over an existing file ("cannot rename because the file
+    // already exists", observed live 2026-11-28 — the service bounced but
+    // the old exe stayed). Overwrite-copy then drop the temp file.
     let ps = format!(
-        "$d='C:/Users/cui/.fleetd'; \
+        "$ErrorActionPreference='Stop'; \
+         $d='C:/Users/cui/.fleetd'; \
          $t = Measure-Command {{ \
              Stop-Service FleetD -Force; \
              Copy-Item \"$d/fleetd.exe\" \"$d/fleetd.exe.bak\" -Force; \
-             Move-Item \"$d/fleetd.new.exe\" \"$d/fleetd.exe\" -Force; \
+             Copy-Item \"$d/fleetd.new.exe\" \"$d/fleetd.exe\" -Force; \
+             Remove-Item \"$d/fleetd.new.exe\" -Force; \
              if (Test-Path \"$d/fleetd-tray.exe.new\") {{ \
                  Copy-Item \"$d/fleetd-tray.exe\" \"$d/fleetd-tray.exe.bak\" -Force -ErrorAction SilentlyContinue; \
-                 Move-Item \"$d/fleetd-tray.exe.new\" \"$d/fleetd-tray.exe\" -Force }}; \
+                 Copy-Item \"$d/fleetd-tray.exe.new\" \"$d/fleetd-tray.exe\" -Force; \
+                 Remove-Item \"$d/fleetd-tray.exe.new\" -Force }}; \
              Start-Service FleetD }}; \
          Write-Output ('stop_window_ms=' + [int]$t.TotalMilliseconds); \
          (Get-Service FleetD).Status"
@@ -342,7 +349,10 @@ pub fn update_remote_windows(host: &str, restart: bool) -> Result<(String, Strin
     // inside `bash -c "ssh ... powershell -Command '...'"` gets its $vars
     // expanded by the LOCAL bash (observed live 2026-11-28: $d/$t arrived
     // empty and PowerShell died on a parse error before touching the
-    // service). scp the script, run it with -File — no quoting layers.
+    // service). scp the script, then run it via the `&` call operator —
+    // the `-File` form once dropped every argument on this ship and just
+    // printed the interactive banner. With ErrorActionPreference=Stop any
+    // failing step aborts with a nonzero exit, so sh() surfaces it.
     let ps_path = std::env::temp_dir().join("fleetd-imac-update.ps1");
     std::fs::write(&ps_path, &ps).context("write update script")?;
     sh(&format!(
@@ -350,11 +360,12 @@ pub fn update_remote_windows(host: &str, restart: bool) -> Result<(String, Strin
         ps_path.display()
     ))
     .with_context(|| format!("scp update script to {host}"))?;
-    sh(&format!(
-        "ssh -o BatchMode=yes {host} powershell -NoProfile -ExecutionPolicy \
-         Bypass -File C:/Users/cui/.fleetd/update.ps1"
+    let out = sh(&format!(
+        "ssh -o BatchMode=yes {host} \
+         \"powershell -NoProfile -Command '& C:/Users/cui/.fleetd/update.ps1'\""
     ))
     .with_context(|| format!("windows swap on {host}"))?;
+    println!("{out}"); // stop_window_ms=... + service status — the evidence
     let from = BUILD_HASH.to_string();
     let to = origin_head().unwrap_or_else(|_| "?".into());
     note(
