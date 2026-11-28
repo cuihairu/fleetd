@@ -1992,14 +1992,48 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// CLI serve path: flags respected (`--port`, `--public`, `--no-scheduler`).
+/// CLI serve path: flags respected (`--port`, `--public`, `--bind host:port`,
+/// `--no-scheduler`). Bind resolution (FLEETD-DASHBOARD-001): default
+/// loopback < config `[serve] bind` < CLI flags. Config load is best-effort —
+/// serve must not depend on fleet.toml being valid.
 fn run_serve_cli(args: &[String]) -> Result<()> {
-    let port = args
-        .iter()
-        .position(|a| a == "--port")
-        .and_then(|i| args.get(i + 1))
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(3790u16);
+    let mut port: u16 = 3790;
+    let mut bind = "127.0.0.1".to_string();
+    let parse_bind = |b: &str| -> Option<(String, u16)> {
+        b.rsplit_once(':')
+            .and_then(|(h, p)| p.parse::<u16>().ok().map(|p| (h.to_string(), p)))
+    };
+    match FleetConfig::load(None).ok().and_then(|c| c.serve.bind) {
+        Some(b) => match parse_bind(&b) {
+            Some((h, p)) => {
+                bind = h;
+                port = p;
+            }
+            None => eprintln!("fleetd serve: ignoring unparseable [serve] bind ({b})"),
+        },
+        None => {}
+    }
+    let flag = |name: &str| -> Option<&str> {
+        args.iter()
+            .position(|a| a == name)
+            .and_then(|i| args.get(i + 1))
+            .map(String::as_str)
+    };
+    if let Some(p) = flag("--port").and_then(|p| p.parse::<u16>().ok()) {
+        port = p;
+    }
+    if args.iter().any(|a| a == "--public") {
+        bind = "0.0.0.0".to_string();
+    }
+    if let Some(b) = flag("--bind") {
+        match parse_bind(b) {
+            Some((h, p)) => {
+                bind = h;
+                port = p;
+            }
+            None => eprintln!("fleetd serve: ignoring unparseable --bind (want host:port)"),
+        }
+    }
     if !args.iter().any(|a| a == "--no-scheduler") {
         std::thread::spawn(|| {
             sched::serve(|| {
@@ -2061,11 +2095,6 @@ fn run_serve_cli(args: &[String]) -> Result<()> {
     let http = args.iter().any(|a| a == "--http");
     #[cfg(unix)]
     {
-        let bind = if args.iter().any(|a| a == "--public") {
-            "0.0.0.0"
-        } else {
-            "127.0.0.1"
-        };
         if http {
             let uds = scheduler::events::flagship_socket_path();
             std::thread::spawn(move || {
@@ -2073,7 +2102,7 @@ fn run_serve_cli(args: &[String]) -> Result<()> {
                     eprintln!("fleetd unix socket face: {e:#}");
                 }
             });
-            events::serve_on(bind, port)?;
+            events::serve_on(&bind, port)?;
         } else {
             events::serve_on_unix(&scheduler::events::flagship_socket_path())?;
         }
@@ -2081,7 +2110,7 @@ fn run_serve_cli(args: &[String]) -> Result<()> {
     #[cfg(windows)]
     {
         let _ = http;
-        events::serve_on("127.0.0.1", port)?;
+        events::serve_on(&bind, port)?;
     }
     Ok(())
 }

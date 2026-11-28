@@ -57,6 +57,17 @@ impl Host {
     }
 }
 
+/// `[serve]` section — the flagship's listen face (FLEETD-DASHBOARD-001).
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ServeCfg {
+    /// Listen address "host:port" (e.g. "127.0.0.1:3790"). Absent = the
+    /// historical loopback default; "0.0.0.0:3790" reaches the dashboard
+    /// from the ZT net / LAN. Remote peers get GET-only route policy
+    /// (writes stay loopback/token — the control plane is not web-exposed).
+    #[serde(default)]
+    pub bind: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct FleetConfig {
     /// Legacy face: one host = one implicit claude executor. Kept for
@@ -67,6 +78,9 @@ pub struct FleetConfig {
     /// single claude executor), so old configs keep working unchanged.
     #[serde(default)]
     pub workers: Vec<Worker>,
+    /// Optional `[serve]` section; absent = loopback default bind.
+    #[serde(default)]
+    pub serve: ServeCfg,
 }
 
 /// One declared executor on a worker: a dispatchable capability with its
@@ -216,6 +230,7 @@ mod tests {
         FleetConfig {
             hosts,
             workers: Vec::new(),
+            serve: ServeCfg::default(),
         }
     }
 

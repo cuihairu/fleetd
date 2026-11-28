@@ -817,6 +817,89 @@ fn dispatch_state(c: &Connection, id: i64) -> Result<Option<String>> {
         .optional()?)
 }
 
+// --- dashboard read faces (FLEETD-DASHBOARD-001) ---
+// Read-only list queries backing the web board's dispatches block and event
+// tail. JSON-only GET exposure; never a write path.
+
+/// One dispatch in the board list (any state).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DispatchRow {
+    pub id: i64,
+    pub seat: String,
+    pub tag: String,
+    /// fired / inflight / partial / done / review / review_failed / stalled…
+    pub state: String,
+    pub fired_at: i64,
+    pub finished_at: Option<i64>,
+    pub baseline_head: Option<String>,
+    pub head_at_finish: Option<String>,
+    pub reject_count: i64,
+    pub evidence_path: Option<String>,
+}
+
+/// Recent dispatches, newest fire first, capped at `limit` — the board's
+/// dispatches block (in-flight/review highlighting is the page's concern).
+pub fn dispatch_list(c: &Connection, limit: u32) -> Result<Vec<DispatchRow>> {
+    let mut st = c.prepare(
+        "SELECT id,seat,tag,state,fired_at,finished_at,baseline_head,head_at_finish,\
+         reject_count,evidence_path
+         FROM dispatches ORDER BY fired_at DESC, id DESC LIMIT ?1",
+    )?;
+    let rows = st
+        .query_map(rusqlite::params![limit], |r| {
+            Ok(DispatchRow {
+                id: r.get(0)?,
+                seat: r.get(1)?,
+                tag: r.get(2)?,
+                state: r.get(3)?,
+                fired_at: r.get(4)?,
+                finished_at: r.get(5)?,
+                baseline_head: r.get(6)?,
+                head_at_finish: r.get(7)?,
+                reject_count: r.get(8)?,
+                evidence_path: r.get(9)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// One ledger event in the board's tail.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EventRow {
+    pub id: i64,
+    pub ts: i64,
+    pub seat: String,
+    pub kind: String,
+    pub verdict: Option<String>,
+    pub head: Option<String>,
+    pub open_count: Option<i64>,
+    pub dirty_count: Option<i64>,
+}
+
+/// Recent events, newest first, capped at `limit` — the board's event tail.
+pub fn events_list(c: &Connection, limit: u32) -> Result<Vec<EventRow>> {
+    let mut st = c.prepare(
+        "SELECT id,ts,seat,kind,verdict,head,open_count,dirty_count
+         FROM events ORDER BY id DESC LIMIT ?1",
+    )?;
+    let rows = st
+        .query_map(rusqlite::params![limit], |r| {
+            Ok(EventRow {
+                id: r.get(0)?,
+                ts: r.get(1)?,
+                seat: r.get(2)?,
+                kind: r.get(3)?,
+                verdict: r.get(4)?,
+                head: r.get(5)?,
+                open_count: r.get(6)?,
+                dirty_count: r.get(7)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 /// Pass a review: the dispatch lands as done and the evidence path is
 /// recorded for audit. Evidence is mandatory — "no evidence, no done" is
 /// the whole hook this gate exists to enforce.
@@ -1274,6 +1357,41 @@ mod tests {
 
     fn put_blocker(c: &Connection, seat: &str, key: &str, content: &str) {
         memory_put(c, key, Some(seat), Some("blocker"), content, Some("fleetd")).unwrap();
+    }
+
+    #[test]
+    fn dashboard_lists_newest_first_and_capped() {
+        let c = mem();
+        for (seat, tag, state, fired) in [
+            ("a", "old", "done", 1000),
+            ("b", "newest", "review", 3000),
+            ("c", "mid", "active", 2000),
+        ] {
+            c.execute(
+                "INSERT INTO dispatches(seat,tag,fired_at,state) VALUES(?1,?2,?3,?4)",
+                rusqlite::params![seat, tag, fired, state],
+            )
+            .unwrap();
+        }
+        c.execute(
+            "INSERT INTO events(ts,seat,kind,verdict) VALUES(100,'a','stop','clean')",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO events(ts,seat,kind) VALUES(200,'b','pane_died')",
+            [],
+        )
+        .unwrap();
+        let d = dispatch_list(&c, 2).unwrap();
+        assert_eq!(d.len(), 2);
+        assert_eq!(d[0].tag, "newest", "newest fire first");
+        assert_eq!(d[0].state, "review");
+        assert_eq!(d[1].tag, "mid");
+        let e = events_list(&c, 1).unwrap();
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0].seat, "b", "newest id first");
+        assert_eq!(e[0].verdict, None);
     }
 
     #[test]

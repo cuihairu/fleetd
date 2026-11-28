@@ -177,6 +177,15 @@ fn resources_json(c: &rusqlite::Connection) -> Result<String> {
     Ok(serde_json::json!({ "hosts": hosts, "rows": row_json }).to_string())
 }
 
+/// Read-face policy (FLEETD-DASHBOARD-001): fleet-status GET faces serve any
+/// connected peer so the board renders from ZT/LAN devices. Exposure is
+/// decided by the bind address (loopback bind = still local-only); write
+/// faces keep the strict `loopback_peer` gate — the control plane (dispatch,
+/// review pass/fail, memory, ledger ingest) is not web-exposed.
+fn read_face_peer<S: Read + Write + PeerAddr>(_stream: &S) -> bool {
+    true
+}
+
 /// 泛化到 Read+Write:HTTP 解析只做读写,UnixListener/插座面同链路复用
 /// (2026-11-27 UNIX socket 默认面拆分)。
 pub fn handle_stream<S: Read + Write + PeerAddr>(
@@ -222,20 +231,28 @@ pub fn handle_stream<S: Read + Write + PeerAddr>(
         .to_string();
 
     // Relay-face auth (relay-design F5): when a token is configured, the
-    // fleet/summary GET and the heartbeat POST require it; /v1/events stays
-    // open for the loopback hook path (hooks run on the flagship itself).
+    // fleet/summary GET and the heartbeat POST require it. /v1/events POST
+    // no longer bypasses the token (DASHBOARD-001 tightening): the ledger
+    // ingest is a WRITE face and is loopback-only now — hooks (the only
+    // writers) run on the flagship, and the server was loopback-bound before
+    // this change, so no remote writer ever existed to break.
     let token_ok = relay_token.is_none()
-        || request_line.contains("/v1/events")
         || head.lines().any(|l| {
             l.to_ascii_lowercase().starts_with("authorization:")
                 && l.contains(relay_token.unwrap_or(""))
         });
 
     let (status, payload) = match request_line.split_whitespace().next() {
-        Some("POST") if request_line.contains("/v1/events") => match ingest(&body) {
-            Ok(v) => (200, format!(r#"{{"verdict":"{}"}}"#, v)),
-            Err(e) => (400, format!(r#"{{"error":"{}"}}"#, e)),
-        },
+        Some("POST") if request_line.contains("/v1/events") => {
+            if !loopback_peer(stream) {
+                (403, r#"{"error":"loopback only"}"#.to_string())
+            } else {
+                match ingest(&body) {
+                    Ok(v) => (200, format!(r#"{{"verdict":"{}"}}"#, v)),
+                    Err(e) => (400, format!(r#"{{"error":"{}"}}"#, e)),
+                }
+            }
+        }
         // Agent heartbeat (relay F2): ships behind NAT/unstable networks
         // POST {seat, head, dirty} on an outbound timer; the response
         // carries pending pull-dispatches. Auth: relay token (F5).
@@ -308,10 +325,10 @@ pub fn handle_stream<S: Read + Write + PeerAddr>(
             }
         }
         // Resource facts face (FLEETD-RES-002): the probe results behind the
-        // CLI `resources summary/list`, as JSON. Loopback gate like the other
-        // local faces — the data names internal hosts and ssh aliases.
+        // CLI `resources summary/list`, as JSON. Board data face — open per
+        // read_face_peer (DASHBOARD-001); the data names internal hosts.
         Some("GET") if request_line.contains("/v1/resources") => {
-            if !loopback_peer(stream) {
+            if !read_face_peer(stream) {
                 (403, r#"{"error":"loopback only"}"#.to_string())
             } else {
                 match store::ledger::open() {
@@ -410,7 +427,8 @@ pub fn handle_stream<S: Read + Write + PeerAddr>(
             if (request_line.contains("/v1/fleet") || request_line.contains("/v1/seats"))
                 && !request_line.contains("/v1/fleet/summary") =>
         {
-            if !loopback_peer(stream) {
+            // Board data face: open per read_face_peer (DASHBOARD-001).
+            if !read_face_peer(stream) {
                 (403, r#"{"error":"loopback only"}"#.to_string())
             } else {
                 let state_filter = query_param(request_line, "state").unwrap_or_default();
@@ -457,10 +475,56 @@ pub fn handle_stream<S: Read + Write + PeerAddr>(
                 }
             }
         }
+        // Dispatch board face (FLEETD-DASHBOARD-001): recent dispatches of
+        // any state, newest fire first (?limit=N, default 15). Read-only
+        // JSON, open per read_face_peer — in-flight/review highlighting is
+        // the page's concern.
+        Some("GET") if request_line.contains("/v1/dispatches") => {
+            let limit = query_param(request_line, "limit")
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(15)
+                .clamp(1, 200);
+            match store::ledger::open().and_then(|c| store::ledger::dispatch_list(&c, limit)) {
+                Ok(rows) => match serde_json::to_string(&rows) {
+                    Ok(j) => (200, j),
+                    Err(e) => (500, format!(r#"{{"error":"{}"}}"#, e)),
+                },
+                Err(e) => (500, format!(r#"{{"error":"{}"}}"#, e)),
+            }
+        }
+        // Event tail face (FLEETD-DASHBOARD-001): recent ledger events
+        // newest first (?limit=N, default 20). Read-only JSON, open per
+        // read_face_peer; the POST ingest above stays loopback-only.
+        Some("GET") if request_line.contains("/v1/events") => {
+            let limit = query_param(request_line, "limit")
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(20)
+                .clamp(1, 500);
+            match store::ledger::open().and_then(|c| store::ledger::events_list(&c, limit)) {
+                Ok(rows) => match serde_json::to_string(&rows) {
+                    Ok(j) => (200, j),
+                    Err(e) => (500, format!(r#"{{"error":"{}"}}"#, e)),
+                },
+                Err(e) => (500, format!(r#"{{"error":"{}"}}"#, e)),
+            }
+        }
+        // Dashboard board page (FLEETD-DASHBOARD-001): GET / serves the
+        // single-file HTML (include_str!, zero external assets). The page
+        // JS polls the read faces only — GET / is open to any connected
+        // peer; the bind address decides exposure.
+        Some("GET")
+            if request_line
+                .split_whitespace()
+                .nth(1)
+                .map(|p| p == "/" || p.starts_with("/?") || p == "/index.html")
+                .unwrap_or(false) =>
+        {
+            (200, include_str!("dashboard.html").to_string())
+        }
         // Memory face (FLEETD-MEM-001, docs/agent-support.md §4.2): the
         // convention + storage face for fleet-memory notes. Loopback gate
-        // only (same charter as /v1/fleet). GET lists newest-update first;
-        // PUT upserts by the UNIQUE key.
+        // only (NOT a board face — free-form notes stay off the web).
+        // GET lists newest-update first; PUT upserts by the UNIQUE key.
         Some("PUT") if request_line.contains("/v1/memory") => {
             if !loopback_peer(stream) {
                 (403, r#"{"error":"loopback only"}"#.to_string())
@@ -535,8 +599,15 @@ pub fn handle_stream<S: Read + Write + PeerAddr>(
         }
         _ => (404, r#"{"error":"not found"}"#.to_string()),
     };
+    // The board page is the only non-JSON payload; its doctype sentinel
+    // picks the HTML content type, everything else stays application/json.
+    let ctype = if payload.starts_with("<!DOCTYPE html>") {
+        "text/html; charset=utf-8"
+    } else {
+        "application/json"
+    };
     let resp = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         payload.len(),
         payload
     );

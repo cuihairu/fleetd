@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>舰长台 · fleet board</title>
+<style>
+  :root {
+    --bg: #0d1117; --card: #161b22; --line: #21262d; --fg: #e6edf3;
+    --dim: #8b949e; --green: #3fb950; --red: #f85149; --yellow: #d29922;
+    --blue: #58a6ff; --purple: #bc8cff; --orange: #db6d28;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.5 -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    padding: 12px;
+  }
+  header { display: flex; align-items: baseline; gap: 12px; padding: 4px 2px 10px; }
+  header h1 { font-size: 18px; margin: 0; letter-spacing: 1px; }
+  header .sub { color: var(--dim); font-size: 12px; }
+  header .err { color: var(--red); font-size: 12px; }
+  section { margin: 0 0 18px; }
+  section h2 {
+    font-size: 12px; color: var(--dim); text-transform: uppercase;
+    letter-spacing: 2px; margin: 0 0 8px; border-bottom: 1px solid var(--line);
+    padding-bottom: 4px;
+  }
+  /* machine rows */
+  .mrow {
+    display: grid; grid-template-columns: 14px 130px repeat(4, minmax(90px, 1fr));
+    gap: 8px; padding: 6px 10px; background: var(--card);
+    border: 1px solid var(--line); border-radius: 6px; margin-bottom: 4px;
+    align-items: center; font-size: 13px;
+  }
+  .mrow .name { font-weight: 600; }
+  .mrow .cell { color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--dim); }
+  .dot.on { background: var(--green); } .dot.off { background: var(--red); }
+  /* seat grid */
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(185px, 1fr)); gap: 8px; }
+  .seat {
+    background: var(--card); border: 1px solid var(--line); border-radius: 6px;
+    padding: 8px 10px; min-height: 74px;
+  }
+  .seat .top { display: flex; justify-content: space-between; align-items: center; }
+  .seat .nm { font-weight: 600; }
+  .chip {
+    font-size: 11px; padding: 1px 8px; border-radius: 10px;
+    background: var(--line); color: var(--dim); white-space: nowrap;
+  }
+  .chip.working { background: rgba(63,185,80,.15); color: var(--green); }
+  .chip.blocked { background: rgba(210,153,34,.15); color: var(--yellow); }
+  .chip.stalled { background: rgba(248,81,73,.15); color: var(--red); }
+  .chip.review  { background: rgba(188,140,255,.15); color: var(--purple); }
+  .seat .meta { color: var(--dim); font-size: 12px; margin-top: 4px; word-break: break-all; }
+  .seat .flags { margin-top: 4px; font-size: 12px; display: flex; gap: 8px; }
+  .seat .flags span { color: var(--dim); }
+  .seat .flags .hot { color: var(--yellow); } .seat .flags .bad { color: var(--red); }
+  /* dispatch table */
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; color: var(--dim); font-weight: 500; font-size: 12px;
+       padding: 4px 8px; border-bottom: 1px solid var(--line); }
+  td { padding: 5px 8px; border-bottom: 1px solid var(--line); }
+  tr.hl td { background: rgba(219,109,40,.08); }   /* in-flight / review rows */
+  tr.bad td { background: rgba(248,81,73,.08); }   /* review_failed rows */
+  td .tag { color: var(--dim); }
+  /* event tail */
+  ul { list-style: none; margin: 0; padding: 0; font-size: 13px; }
+  li { padding: 3px 0; border-bottom: 1px dashed var(--line); display: flex; gap: 10px; }
+  li .t { color: var(--dim); flex: 0 0 84px; }
+  li .k { flex: 0 0 110px; }
+  li .k.warn { color: var(--red); } li .k.ok { color: var(--green); }
+  li .v { color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .block-err { color: var(--red); font-size: 12px; padding: 6px 2px; }
+  @media (max-width: 640px) {
+    .mrow { grid-template-columns: 14px 100px 1fr; }
+    .mrow .cell:nth-child(5), .mrow .cell:nth-child(6) { display: none; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>舰长台</h1>
+  <span class="sub" id="upd">connecting…</span>
+  <span class="err" id="err"></span>
+</header>
+
+<section>
+  <h2>机器</h2>
+  <div id="machines"><div class="block-err">loading…</div></div>
+</section>
+
+<section>
+  <h2>席位</h2>
+  <div id="seats" class="grid"><div class="block-err">loading…</div></div>
+</section>
+
+<section>
+  <h2>派单（in-flight / review 优先）</h2>
+  <div id="dispatches"><div class="block-err">loading…</div></div>
+</section>
+
+<section>
+  <h2>事件尾流（最近 20）</h2>
+  <div id="events"><div class="block-err">loading…</div></div>
+</section>
+
+<script>
+"use strict";
+// fleet board (FLEETD-DASHBOARD-001): zero-framework single page.
+// READ-ONLY by design — every request below is a GET; the write faces
+// (dispatch / review / memory / ingest) are loopback-gated server-side.
+
+const REFRESH_MS = 3000;
+
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g,
+  (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+function get(url) {
+  return fetch(url, { method: "GET" }).then((r) => {
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    return r.json();
+  });
+}
+
+function ago(ts) {
+  if (!ts) return "—";
+  const s = Math.max(0, Math.floor(Date.now() / 1000 - ts));
+  if (s < 60) return s + "s前";
+  if (s < 3600) return Math.floor(s / 60) + "m前";
+  if (s < 86400) return Math.floor(s / 3600) + "h前";
+  return Math.floor(s / 86400) + "d前";
+}
+function hm(ts) {
+  if (!ts) return "—";
+  const d = new Date(ts * 1000);
+  const p = (n) => String(n).padStart(2, "0");
+  return p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
+}
+
+const SEAT_CHIP = {
+  working: "working", busy: "working", blocked: "blocked",
+  stalled: "stalled", review: "review", idle: "",
+};
+// dispatch state → (chip class, row highlight class)
+const DISPATCH_STATE = {
+  active: ["", "hl"], inflight: ["working", "hl"], fired: ["", "hl"],
+  partial: ["blocked", "hl"], review: ["review", "hl"],
+  review_failed: ["stalled", "bad"], stalled: ["stalled", "bad"],
+  done: ["working", ""],
+};
+
+function renderMachines(data) {
+  const box = $("machines");
+  const hosts = (data && data.hosts) || [];
+  if (!hosts.length) { box.innerHTML = '<div class="block-err">无机器数据（先跑 fleetd resources probe）</div>'; return; }
+  box.innerHTML = hosts.map((h) => {
+    const on = (h.tools ?? 0) > 0 || h.carrier || h.vm || (h.docker || "").startsWith("online");
+    const dot = on ? "on" : "off";
+    return '<div class="mrow">' +
+      '<span class="dot ' + dot + '"></span>' +
+      '<span class="name">' + esc(h.host) + "</span>" +
+      '<span class="cell">tools=' + esc(h.tools ?? "-") + "</span>" +
+      '<span class="cell">docker=' + esc(h.docker || "-") + "</span>" +
+      '<span class="cell">carrier=' + esc(h.carrier || "-") + "</span>" +
+      '<span class="cell">vm:pve=' + esc(h.vm || "-") + "</span>" +
+      "</div>";
+  }).join("");
+}
+
+function renderSeats(rows) {
+  const box = $("seats");
+  if (!rows || !rows.length) { box.innerHTML = '<div class="block-err">无常驻席位数据</div>'; return; }
+  box.innerHTML = rows.map((s) => {
+    const chip = SEAT_CHIP[s.state] ?? "";
+    const label = esc(s.state || "?");
+    let flags = "";
+    if (s.executor) flags += "<span>" + esc(s.executor) + "</span>";
+    if (s.review > 0) flags += '<span class="bad">review ' + s.review + "</span>";
+    if (s.blocked > 0) flags += '<span class="hot">blocked ' + s.blocked + "</span>";
+    if (s.open > 0) flags += "<span>open " + s.open + "</span>";
+    return '<div class="seat">' +
+      '<div class="top"><span class="nm">' + esc(s.seat) + '</span>' +
+      '<span class="chip ' + chip + '">' + label + "</span></div>" +
+      '<div class="meta">' + (s.last_commit ? "commit " + esc(String(s.last_commit).slice(0, 12)) : "无 commit 记录") +
+      " · " + ago(s.last_event_ts) + "</div>" +
+      '<div class="flags">' + flags + "</div>" +
+      "</div>";
+  }).join("");
+}
+
+function renderDispatches(rows) {
+  const box = $("dispatches");
+  if (!rows || !rows.length) { box.innerHTML = '<div class="block-err">无派单记录</div>'; return; }
+  const head = "<tr><th>#</th><th>席位</th><th>任务</th><th>状态</th><th>发起</th><th>完成</th><th>驳回</th><th>证据</th></tr>";
+  const body = rows.map((d) => {
+    const [chip, rowCls] = DISPATCH_STATE[d.state] ?? ["", ""];
+    return '<tr class="' + rowCls + '">' +
+      "<td>" + d.id + "</td>" +
+      "<td>" + esc(d.seat) + "</td>" +
+      '<td class="tag">' + esc(String(d.tag || "").slice(0, 40)) + "</td>" +
+      '<td><span class="chip ' + chip + '">' + esc(d.state) + "</span></td>" +
+      "<td>" + hm(d.fired_at) + "</td>" +
+      "<td>" + (d.finished_at ? hm(d.finished_at) : "…") + "</td>" +
+      "<td>" + (d.reject_count > 0 ? '<span class="bad">' + d.reject_count + "</span>" : "0") + "</td>" +
+      '<td class="tag">' + esc(d.evidence_path ? "✓" : "") + "</td>" +
+      "</tr>";
+  }).join("");
+  box.innerHTML = "<table>" + head + body + "</table>";
+}
+
+function renderEvents(rows) {
+  const box = $("events");
+  if (!rows || !rows.length) { box.innerHTML = '<div class="block-err">无事件</div>'; return; }
+  box.innerHTML = "<ul>" + rows.map((e) => {
+    const warn = /died|fail|down|stall|reject|error/.test(e.kind || "") || e.verdict === "dirty" || e.verdict === "untracked";
+    const ok = /complete|done|pass|clean/.test(e.kind || "") || e.verdict === "clean";
+    const kcls = warn ? "k warn" : ok ? "k ok" : "k";
+    const extra = e.verdict ? " → " + esc(e.verdict) : "";
+    return "<li>" +
+      '<span class="t">' + hm(e.ts) + "</span>" +
+      "<span>" + esc(e.seat) + "</span>" +
+      '<span class="' + kcls + '">' + esc(e.kind) + extra + "</span>" +
+      '<span class="v">' + esc(e.head || "") + "</span>" +
+      "</li>";
+  }).join("") + "</ul>";
+}
+
+function render(dataList) {
+  const [machines, seats, dispatches, events] = dataList;
+  $("err").textContent = "";
+  renderMachines(machines.ok ? machines.v : null);
+  renderSeats(seats.ok ? seats.v : null);
+  renderDispatches(dispatches.ok ? dispatches.v : null);
+  renderEvents(events.ok ? events.v : null);
+  const names = ["resources", "fleet", "dispatches", "events"];
+  const failed = dataList.map((r, i) => (r.ok ? null : names[i])).filter(Boolean);
+  if (failed.length) {
+    $("err").textContent = "接口异常: " + failed.join(", ");
+  }
+  $("upd").textContent = "每 " + (REFRESH_MS / 1000) + "s 轮询 · 更新 " + hm(Date.now() / 1000);
+}
+
+function tick() {
+  // GET-only: the four read faces. AllSettled keeps stale blocks alive when
+  // one endpoint hiccups instead of blanking the whole board.
+  Promise.allSettled([
+    get("/v1/resources"), get("/v1/fleet"),
+    get("/v1/dispatches?limit=15"), get("/v1/events?limit=20"),
+  ]).then((rs) => render(rs.map((r) =>
+    r.status === "fulfilled" ? { ok: true, v: r.value } : { ok: false })));
+  setTimeout(tick, REFRESH_MS);
+}
+tick();
+</script>
+</body>
+</html>
