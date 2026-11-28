@@ -451,7 +451,13 @@ pub fn record_dispatch(
     c.execute(
         "INSERT INTO dispatches(seat,tag,fired_at,baseline_head,acceptance)
          VALUES(?1,?2,?3,?4,?5)",
-        rusqlite::params![seat, tag, ts, captured, task_spec_for_tag(tag).acceptance.as_str()],
+        rusqlite::params![
+            seat,
+            tag,
+            ts,
+            captured,
+            task_spec_for_tag(tag).acceptance.as_str()
+        ],
     )?;
     Ok(())
 }
@@ -497,12 +503,12 @@ pub fn progress(c: &Connection, days: u64) -> Result<Vec<SeatProgress>> {
     let mut st = c.prepare(
         "SELECT seat,
             COUNT(*) AS fired,
-            SUM(outcome='completed' AND state='done') AS completed,
-            SUM(outcome IS NULL) AS inflight,
-            SUM(outcome='stalled') AS stalled,
-            SUM(outcome='partial') AS partial,
-            SUM(state='review') AS review,
-            SUM(state='review_failed') AS review_failed
+            COALESCE(SUM(outcome='completed' AND state='done'), 0) AS completed,
+            COALESCE(SUM(outcome IS NULL), 0) AS inflight,
+            COALESCE(SUM(outcome='stalled'), 0) AS stalled,
+            COALESCE(SUM(outcome='partial'), 0) AS partial,
+            COALESCE(SUM(state='review'), 0) AS review,
+            COALESCE(SUM(state='review_failed'), 0) AS review_failed
          FROM dispatches WHERE fired_at > ?1
          GROUP BY seat ORDER BY seat",
     )?;

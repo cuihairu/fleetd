@@ -18,9 +18,46 @@ use std::net::{TcpListener, TcpStream};
 use std::os::unix::net::UnixListener;
 #[cfg(windows)]
 use std::os::windows::net::UnixListener;
+use std::sync::{Arc, OnceLock, RwLock};
 
+use fleetd_core::machine::MachineStat;
 use fleetd_core::verdict::SeatEvent;
 use store::ledger;
+
+/// Live machine registry (FLEETD-SCHED-MACHINE-001): serve's machine pool
+/// publishes a caps/load/mailbox snapshot here on its reconcile tick, and
+/// GET /v1/machines reads it. A OnceLock keyed to the process, so the route
+/// table needs no signature change — the pool face is optional (a serve
+/// without a usable fleet.toml simply never publishes; the face reads []).
+static LIVE_MACHINES: OnceLock<Arc<RwLock<Vec<MachineStat>>>> = OnceLock::new();
+
+/// Publish the machine-pool snapshot (serve path, once at pool startup).
+pub fn publish_machines(snapshot: Arc<RwLock<Vec<MachineStat>>>) {
+    let _ = LIVE_MACHINES.set(snapshot);
+}
+
+/// CLI side of the machine face: fetch the live snapshot over the flagship
+/// UNIX socket. None when no flagship is listening (caller falls back to
+/// the static config view).
+#[cfg(unix)]
+pub fn fetch_machines_via_socket() -> Option<Vec<MachineStat>> {
+    use std::os::unix::net::UnixStream;
+    let mut s = UnixStream::connect(flagship_socket_path()).ok()?;
+    s.set_read_timeout(Some(std::time::Duration::from_secs(3)))
+        .ok()?;
+    s.write_all(b"GET /v1/machines HTTP/1.1\r\nHost: fleetd\r\nConnection: close\r\n\r\n")
+        .ok()?;
+    let mut buf = Vec::new();
+    let _ = s.read_to_end(&mut buf);
+    let raw = String::from_utf8_lossy(&buf).to_string();
+    let body = raw.split("\r\n\r\n").nth(1)?.trim().to_string();
+    serde_json::from_str(&body).ok()
+}
+
+#[cfg(not(unix))]
+pub fn fetch_machines_via_socket() -> Option<Vec<MachineStat>> {
+    None // windows named-pipe face lands with the windows service build
+}
 
 const MAX_BODY: usize = 256 * 1024;
 
@@ -221,6 +258,26 @@ pub fn handle_stream<S: Read + Write + PeerAddr>(
                         busy
                     ),
                 )
+            }
+        }
+        // Machine plane (FLEETD-SCHED-MACHINE-001): caps / load / mailbox
+        // depth of the live machine pool, refreshed by the scheduler's
+        // reconcile ticker. Loopback gate like the other local faces; the
+        // static fallback lives in `fleetd machines` (config view).
+        Some("GET") if request_line.contains("/v1/machines") => {
+            if !loopback_peer(stream) {
+                (403, r#"{"error":"loopback only"}"#.to_string())
+            } else {
+                match LIVE_MACHINES.get().and_then(|s| s.read().ok()) {
+                    Some(machines) => match serde_json::to_string(&*machines) {
+                        Ok(j) => (200, j),
+                        Err(e) => (500, format!(r#"{{"error":"{}"}}"#, e)),
+                    },
+                    None => (
+                        200,
+                        "[]".to_string(), // no live pool in this process
+                    ),
+                }
             }
         }
         // Presence face (FLEETD-PRESENCE-001): the reconciled liveness of

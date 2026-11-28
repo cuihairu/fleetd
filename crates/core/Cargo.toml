@@ -15,3 +15,5 @@ rusqlite.workspace = true
 dirs.workspace = true
 schemars.workspace = true
 libtmux.workspace = true
+async-trait.workspace = true
+tokio.workspace = true

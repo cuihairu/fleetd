@@ -195,6 +195,71 @@ fn hosts(cfg: &FleetConfig) -> Result<()> {
     Ok(())
 }
 
+/// `fleetd machines`: the machine plane view (FLEETD-SCHED-MACHINE-001).
+/// Live face first — GET /v1/machines over the flagship socket returns the
+/// running pool's caps / load / mailbox depth. Without a flagship the
+/// static config view prints the derived workers plus a process probe.
+fn machines(cfg: &FleetConfig) -> Result<()> {
+    println!(
+        "{:<14} {:<11} {:<8} {:<20} {:>4} {:>7} {:>5} {}",
+        "MACHINE", "CHANNEL", "OS", "EXECUTORS", "SLOT", "RUN/Q", "PROCS", "TAGS"
+    );
+    let live = scheduler::events::fetch_machines_via_socket().unwrap_or_default();
+    if !live.is_empty() {
+        for m in &live {
+            println!(
+                "{:<14} {:<11} {:<8} {:<20} {:>4} {:>7} {:>5} {}  [live]",
+                m.id,
+                m.channel,
+                m.os,
+                m.executors.join(","),
+                m.slots,
+                format!("{}/{}", m.running, m.queued),
+                m.procs,
+                m.tags.join(",")
+            );
+        }
+        return Ok(());
+    }
+    // Static view: config workers (declared or derived from hosts) + a
+    // live claude process probe. Mailbox depth is runtime-only — a "-"
+    // marks it as not observable without the flagship pool.
+    for w in cfg.workers() {
+        let host = if w.channel == "local" {
+            "local".to_string()
+        } else {
+            w.channel
+                .strip_prefix("ssh:")
+                .unwrap_or(&w.channel)
+                .to_string()
+        };
+        let procs = if w.channel == "agent" {
+            0
+        } else {
+            fleetd_core::agent::registry(fleetd_core::agent::AgentKind::Claude)
+                .probe_load(&host, w.max_concurrent())
+                .map(|l| l.running)
+                .unwrap_or(0)
+        };
+        println!(
+            "{:<14} {:<11} {:<8} {:<20} {:>4} {:>7} {:>5} {}  [static]",
+            w.name,
+            w.channel,
+            w.os,
+            w.executors
+                .iter()
+                .map(|e| e.kind.clone())
+                .collect::<Vec<_>>()
+                .join(","),
+            w.max_concurrent(),
+            "-/-".to_string(),
+            procs,
+            w.tags.join(",")
+        );
+    }
+    Ok(())
+}
+
 /// Delete scratch entries older than cleanup_hours on each host.
 fn cleanup(cfg: &FleetConfig) -> Result<()> {
     for h in &cfg.hosts {
@@ -269,6 +334,111 @@ fn dispatch(cfg: &FleetConfig, task_file: &str, repo: &str) -> Result<()> {
             gated.join(", ")
         );
     }
+    // Machine-plane route (FLEETD-SCHED-MACHINE-001): pick + launch move
+    // through the pool mailbox (caps filter -> least load -> submit, a
+    // HeadlessExecutor slot consumer performs the launch). The CLI face
+    // never regresses: any machine-plane failure falls through to the
+    // legacy pick+launch path, unchanged.
+    match dispatch_via_machines(cfg, task_file, repo, &gated) {
+        Ok(()) => return Ok(()),
+        Err(e) => eprintln!("fleetd: machine route unavailable ({e}); legacy path"),
+    }
+    dispatch_legacy(cfg, task_file, repo, &gated)
+}
+
+/// Machine-plane dispatch (FLEETD-SCHED-MACHINE-001): route the task
+/// through the pool mailbox and wait for the delivery receipt. The slot
+/// consumer runs the same launch commands as the legacy path (moved into
+/// HeadlessExecutor), so behavior is identical; only the routing surface
+/// changed from "scan hosts, pick process count" to a message send.
+fn dispatch_via_machines(
+    cfg: &FleetConfig,
+    task_file: &str,
+    repo: &str,
+    gated: &[String],
+) -> Result<()> {
+    let text = std::fs::read_to_string(task_file).context("read task file")?;
+    let rt = tokio::runtime::Runtime::new().context("tokio runtime")?;
+    rt.block_on(async move {
+        let mut machines = fleetd_core::machine::build_machines(cfg, false);
+        machines.retain(|m| !gated.iter().any(|g| g == m.id()));
+        anyhow::ensure!(!machines.is_empty(), "no machines left after gate filter");
+        let pool = fleetd_core::machine::Pool::new(machines);
+        let job = fleetd_core::machine::Job {
+            id: format!("j{}", now()),
+            seat: repo.to_string(),
+            tag: repo.to_string(),
+            text,
+            task_file: task_file.to_string(),
+            requires: fleetd_core::machine::Requires {
+                executor: Some("claude".into()),
+                ..Default::default()
+            },
+        };
+        let handle = pool
+            .route(job)
+            .await
+            .context("no machine accepted the job (all backpressured or unreachable)")?;
+        // Same DISPATCH line shape as the legacy path, sourced from the
+        // chosen machine's caps/load and the host's config facts.
+        let machine = pool
+            .machines()
+            .iter()
+            .find(|m| m.id() == handle.machine_id)
+            .context("chosen machine vanished")?;
+        let workdir = cfg
+            .hosts
+            .iter()
+            .find(|h| h.name == handle.machine_id)
+            .map(|h| h.workdir_or_home())
+            .unwrap_or_else(|| "~".to_string());
+        let load = machine.load();
+        println!(
+            "DISPATCH repo={} -> machine={} (running {}/{} load {:.2} os={} workdir={})",
+            repo,
+            handle.machine_id,
+            load.running,
+            load.slots,
+            load.ratio(),
+            machine.caps().os,
+            workdir
+        );
+        // Wait for the mailbox receipt: Delivered = the seat accepted the
+        // task (the Stop hook still feeds verdicts -> GATE-001 review).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        loop {
+            match pool.status(&handle.job_id).await {
+                Some(fleetd_core::machine::JobState::Delivered) => break,
+                Some(fleetd_core::machine::JobState::Cancelled) => {
+                    anyhow::bail!("machine delivery cancelled");
+                }
+                Some(fleetd_core::machine::JobState::Failed(e)) => {
+                    anyhow::bail!("machine launch failed: {e}");
+                }
+                _ => {}
+            }
+            if std::time::Instant::now() > deadline {
+                anyhow::bail!("machine delivery timed out");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        // Record in ledger (same tasks row as the legacy path).
+        let conn = Connection::open(db_path())?;
+        init_db(&conn)?;
+        let id = format!("{}-{}", now(), repo);
+        conn.execute(
+            "INSERT INTO tasks (id, host, repo, task_file, state, created_at) VALUES (?1, ?2, ?3, ?4, 'dispatched', ?5)",
+            rusqlite::params![id, handle.machine_id, repo, task_file, now()],
+        )?;
+        println!("LEDGER id={} host={} state=dispatched", id, handle.machine_id);
+        Ok(())
+    })
+}
+
+/// Legacy dispatch: scan hosts, pick least claude processes, launch
+/// directly. Kept verbatim as the fallback so the CLI face never regresses
+/// when the machine plane is unavailable (no runtime, route failure).
+fn dispatch_legacy(cfg: &FleetConfig, task_file: &str, repo: &str, gated: &[String]) -> Result<()> {
     let mut running = Vec::new();
     for h in &cfg.hosts {
         // skip unreachable hosts entirely; they never get picked
@@ -398,7 +568,12 @@ fn main() -> Result<()> {
     // a remote ship has no ~/.hermes/fleet.toml and still must come up.
     let needs_hosts = matches!(
         args.get(1).map(String::as_str),
-        Some("status") | Some("hosts") | Some("cleanup") | Some("dispatch-file") | None
+        Some("status")
+            | Some("hosts")
+            | Some("machines")
+            | Some("cleanup")
+            | Some("dispatch-file")
+            | None
     );
     // --- standalone tray process: fleetd tray (pulls /v1/status) ---
     if args.get(1).map(String::as_str) == Some("tray") {
@@ -939,6 +1114,7 @@ fn main() -> Result<()> {
             }
         }
         Some("hosts") => hosts(cfg.as_ref().context("config required")?)?,
+        Some("machines") => machines(cfg.as_ref().context("config required")?)?,
         Some("cleanup") => cleanup(cfg.as_ref().context("config required")?)?,
         Some("dispatch") => {
             // Natural-language dispatch: fleetd dispatch "修一下 kode 的登录超时"
@@ -1623,7 +1799,7 @@ fn main() -> Result<()> {
             run_serve_cli(&args)?;
         }
         _ => {
-            println!("fleetd: dispatch <自然语言任务> | status | hosts | cleanup | dispatch-file <task.md> <repo> | event <seat> | blocked | seat ... | review list|pass|fail | memory ... | serve");
+            println!("fleetd: dispatch <自然语言任务> | status | hosts | machines | cleanup | dispatch-file <task.md> <repo> | event <seat> | blocked | seat ... | review list|pass|fail | memory ... | serve");
             status(cfg.as_ref().context("config required")?)?;
         }
     }
@@ -1655,6 +1831,41 @@ fn run_serve_cli(args: &[String]) -> Result<()> {
     // Presence watch (FLEETD-PRESENCE-001): reconcile seat liveness into the
     // presence table every 60 s, independent of the job scheduler flag.
     std::thread::spawn(move || scheduler::presence::watch_forever(port));
+    // Machine pool (FLEETD-SCHED-MACHINE-001): the CSP runtime face. One
+    // resident pool per serve process; the scheduler select loop keeps the
+    // /v1/machines snapshot fresh on its reconcile tick (job/event sources
+    // stay open for future server-side routing). Best effort: ships without
+    // fleet.toml have no pool and the face reads [].
+    if let Ok(pool_cfg) = fleetd_core::config::FleetConfig::load(None) {
+        std::thread::spawn(move || {
+            let rt = match tokio::runtime::Runtime::new() {
+                Ok(r) => r,
+                Err(_) => return,
+            };
+            rt.block_on(async move {
+                let machines = fleetd_core::machine::build_machines(&pool_cfg, false);
+                let stats_pool = fleetd_core::machine::Pool::new(machines.clone());
+                let sched_pool = fleetd_core::machine::Pool::new(machines);
+                let snapshot = std::sync::Arc::new(std::sync::RwLock::new(Vec::new()));
+                scheduler::events::publish_machines(std::sync::Arc::clone(&snapshot));
+                let (_ptx, prx) = tokio::sync::mpsc::channel::<fleetd_core::machine::Job>(16);
+                let (_etx, erx) = tokio::sync::mpsc::channel::<String>(16);
+                let snap = std::sync::Arc::clone(&snapshot);
+                let sched = fleetd_core::machine::Scheduler::new(
+                    sched_pool,
+                    prx,
+                    erx,
+                    std::sync::Arc::new(|_: &str| {}),
+                    std::sync::Arc::new(move || {
+                        if let Ok(mut w) = snap.write() {
+                            *w = stats_pool.stats();
+                        }
+                    }),
+                );
+                sched.run(std::time::Duration::from_secs(30)).await;
+            });
+        });
+    }
     // 通信面(2026-11-27 钦定):本机默认走 UNIX socket(~/.fleetd/flagship.sock,
     // Windows 同 AF_UNIX);--http 显式开启才起 TCP HTTP 面(跨机 relay/面板)。
     let http = args.iter().any(|a| a == "--http");

@@ -142,3 +142,35 @@ executor 列。与 libtmux 集成合并为 FLEETD-EXECUTOR-001（队列 #7）。
 
 **边界**：检查方本单仍是编排方（Hermes）人工/半自动过闸；自动化检查器（跑测试/看截图的
 review 席）是下一单。review 态超时不设自动过闸——宁可积压不可虚过。
+
+## D8. 机器抽象 CSP 化（2026-11-28 派单 FLEETD-SCHED-MACHINE-001）✅
+
+把 fleetd 执行链抽象成 Go CSP 模型：machine=processor、task=message、dispatch=send、
+receipt=receive，channel 是唯一通信面。落地件 `core/machine.rs`（~1500 行，10 单测全绿）：
+- **MailboxMachine**：每机一个 mpsc 信箱（cap=max_concurrent=N），N 个消费者任务各持一个
+  Semaphore 许可；**许可先于 recv** 是要害——否则消息进等待队列，背压永不显形（真机
+  演示 run1 踩过：投递 3.5s 占着槽，j2 看似"负载改道"实为信箱未满）。全满 → `MailboxFull`
+  错误，Pool::route 顺次改道，全满时报错并列出背压机清单。
+- **多提交竞态**：Queued 记账+jobs 表插入必须先于 try_send，Err 回滚——drainer 在另一线程，
+  消息入道瞬间就可能被消费。
+- **取消走专用无界通道+专职任务**：绝不排在作业后面；状态先迁移再 stop，未知作业 let-else。
+- **Scheduler::run**：tokio::select! 轮 pending_rx/event_rx/ticker；ticker 需 `if 源仍开` 守卫，
+  否则 `else` 臂永不可达、循环退不出（实测踩过）。
+- **Executor 迁移**：`Machine` trait（id/caps/submit/status/cancel/load）+ `Executor` trait
+  （kind/deliver/stop），TmuxExecutor 承接原 agent 面（stop=L1 kill-session+L2 pkill，L3
+  台账闸仍由调用方组合），HeadlessExecutor 承接 headless 面逐字迁移；AgentMachine 占位
+  （pull 模式，relay F2 范围外，submit 即拒）。
+- **配置兼容**：hosts 配置原样可用（按 executors 派生 channel），fleet.toml `[[workers]]`
+  显式声明则替换派生值。
+- **接线**：`fleetd machines` CLI（活表走 /v1/machines UDS 面，`[live]`/`[static]` 标注，
+  PROCS 列用 Claude 进程探针）；serve 起真池（build_machines→publish_machines→Scheduler
+  30s 对账）；dispatch CLI 先走机器池、Err 回落 legacy 面逐字保底（零回归）。
+- **GATE-001 挂接**：机器池只做投递 reservation（Completed→Stop hook→台账 ingest 的 review
+  闸不动，复用既有链）。
+
+**真机验收**（`tests/csp_dual_machine_demo.rs`，#[ignore] 手动跑）：LocalMachine 本席 tmux +
+SshMachine work-runner 双机各 1 槽，j1 本地、j2 满载改道远端、j3/j4 入队、j5 双满背压报错、
+双 pane 见任务书原文、cancel 真杀 tmux 会话——2026-11-28 四机位全绿 15.3s。
+**陷阱实录**：全新目录的信任框默认选「No, exit」，投递的 Enter 会确认退出（headless
+`-p` 预信任不落盘，run2/run3 连败）；解法=目录放已信任的 workspaces 根下+等待循环里
+见「Yes, I trust this folder」就 Down+Enter（run4 实证）。
