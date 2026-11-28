@@ -173,10 +173,7 @@ pub fn update_local(restart: bool) -> Result<(String, String)> {
 /// `libpython3.14.so.1.0: cannot open shared object file` (observed live on
 /// work-runner, 2026-11-28 — the update must ship the library alongside).
 pub fn bundled_libpython() -> Option<String> {
-    let out = Command::new("ldd")
-        .arg(built_binary())
-        .output()
-        .ok()?;
+    let out = Command::new("ldd").arg(built_binary()).output().ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
     for line in text.lines() {
         if line.contains("libpython") && line.contains("=>") {
@@ -204,10 +201,7 @@ pub fn system_stdlib_dir() -> Option<String> {
                 .map(|n| {
                     let p = format!("{base}/{n}");
                     // Sort key: the numeric minor, newest wins.
-                    let minor: u32 = n
-                        .trim_start_matches("python3.")
-                        .parse()
-                        .unwrap_or(0);
+                    let minor: u32 = n.trim_start_matches("python3.").parse().unwrap_or(0);
                     (p, minor.to_string())
                 })
                 .collect();
@@ -245,8 +239,10 @@ pub fn update_remote_linux(host: &str, restart: bool) -> Result<(String, String)
         // Explicit remote filename — a trailing-slash directory target
         // exits 0 without landing the file under sftp (observed live).
         let name = lib.rsplit('/').next().unwrap_or("libpython3.so");
-        sh(&format!("scp -o BatchMode=yes {lib} {host}:{dir}/runtime/lib/{name}"))
-            .with_context(|| format!("scp {lib} to {host}"))?;
+        sh(&format!(
+            "scp -o BatchMode=yes {lib} {host}:{dir}/runtime/lib/{name}"
+        ))
+        .with_context(|| format!("scp {lib} to {host}"))?;
     }
     // The stdlib tree rides a tar stream — scp has no -r equivalent that
     // survives the sftp path quirks, and tar preserves everything in one shot.

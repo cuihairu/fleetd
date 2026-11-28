@@ -16,8 +16,6 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 #[cfg(unix)]
 use std::os::unix::net::UnixListener;
-#[cfg(windows)]
-use std::os::windows::net::UnixListener;
 use std::sync::{Arc, OnceLock, RwLock};
 
 use fleetd_core::machine::MachineStat;
@@ -116,13 +114,6 @@ impl PeerAddr for std::net::TcpStream {
 
 #[cfg(unix)]
 impl PeerAddr for std::os::unix::net::UnixStream {
-    fn peer_addr(&self) -> std::io::Result<Option<std::net::SocketAddr>> {
-        Ok(None)
-    }
-}
-
-#[cfg(windows)]
-impl PeerAddr for std::os::windows::net::UnixStream {
     fn peer_addr(&self) -> std::io::Result<Option<std::net::SocketAddr>> {
         Ok(None)
     }
@@ -536,31 +527,9 @@ pub fn serve_on_unix(sock_path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-/// Windows 侧 AF_UNIX 面(签名一致;Windows 10 1803+ 支持)。
-#[cfg(windows)]
-pub fn serve_on_unix(sock_path: &std::path::Path) -> Result<()> {
-    let relay_token = std::env::var("FLEETD_RELAY_TOKEN")
-        .ok()
-        .filter(|t| !t.is_empty());
-    if let Some(dir) = sock_path.parent() {
-        std::fs::create_dir_all(dir).with_context(|| "create socket dir")?;
-    }
-    let _ = std::fs::remove_file(sock_path);
-    let listener =
-        UnixListener::bind(sock_path).with_context(|| format!("bind unix socket {sock_path:?}"))?;
-    eprintln!("fleetd flagship socket: {sock_path:?} (local tray face)");
-    for stream in listener.incoming() {
-        match stream {
-            Ok(mut s) => {
-                if let Err(e) = handle_stream(&mut s, relay_token.as_deref()) {
-                    eprintln!("event handling error: {e:#}");
-                }
-            }
-            Err(e) => eprintln!("accept error: {e:#}"),
-        }
-    }
-    Ok(())
-}
+/// Windows 侧没有 AF_UNIX 面：std 的 windows UnixListener 是 nightly-only
+/// (`windows_unix_domain_sockets`)，且 2026-11-28 dispatch 已钦定 tray↔flagship
+/// 走 loopback TCP——windows 的本机面就是 `serve_on("127.0.0.1", 3790)`。
 
 /// Socket 路径约定:~/.fleetd/flagship.sock(全平台同一规则)。
 pub fn flagship_socket_path() -> std::path::PathBuf {

@@ -24,10 +24,18 @@ use windows_service::{
 
 define_windows_service!(ffi_service_main, fleetd_service_main);
 
-/// Entry invoked by the SCM thread: dispatch (blocks until stop).
-pub fn run() -> windows_service::Result<()> {
+/// Entry invoked by the SCM thread: dispatch (blocks until stop). The real
+/// serve face is injected by the binary crate — this crate cannot call into
+/// the fleetd root directly (it is a separate compilation unit).
+pub fn run(serve: fn() -> anyhow::Result<()>) -> windows_service::Result<()> {
+    // Thread-local hand-off: the SCM main thread is gone by the time
+    // fleetd_service_main spawns the serve thread, so carry the entry
+    // through a static.
+    SERVE_ENTRY.set(serve);
     service_dispatcher::start("FleetD", ffi_service_main)
 }
+
+static SERVE_ENTRY: std::sync::OnceLock<fn() -> anyhow::Result<()>> = std::sync::OnceLock::new();
 
 fn fleetd_service_main(args: Vec<std::ffi::OsString>) {
     // SCM context has no stderr — persist any failure to FLEETD_SVC_ERR so
@@ -42,6 +50,7 @@ fn fleetd_service_main(args: Vec<std::ffi::OsString>) {
 }
 
 fn run_service(_args: Vec<std::ffi::OsString>) -> windows_service::Result<()> {
+    let serve = SERVE_ENTRY.get().copied().unwrap_or(default_serve_entry);
     let (tx, rx) = mpsc::channel();
     let handler = move |control: ServiceControl| -> ServiceControlHandlerResult {
         match control {
@@ -65,8 +74,8 @@ fn run_service(_args: Vec<std::ffi::OsString>) -> windows_service::Result<()> {
         // 32 MiB: the serve stack hosts pyhost init with deep frames; the
         // 2 MiB default overflow-killed the whole process (7031 hunt).
         .stack_size(32 * 1024 * 1024)
-        .spawn(|| {
-            if let Err(e) = crate::run_serve_from_service() {
+        .spawn(move || {
+            if let Err(e) = serve() {
                 eprintln!("fleetd serve error: {e:#}");
             }
         })
@@ -84,6 +93,12 @@ fn run_service(_args: Vec<std::ffi::OsString>) -> windows_service::Result<()> {
 
     status_handle.set_service_status(stopped_status())?;
     Ok(())
+}
+
+/// Reachable only if `run` was never called with a real entry — say so
+/// loudly instead of silently running nothing.
+fn default_serve_entry() -> anyhow::Result<()> {
+    anyhow::bail!("no serve entry injected: start the service through the fleetd binary")
 }
 
 fn running_status() -> ServiceStatus {

@@ -555,13 +555,17 @@ fn main() -> Result<()> {
     // (error 1053, observed live 2026-11-27).
     #[cfg(target_os = "windows")]
     if std::env::args().any(|a| a == "--service") {
-        scm_service::run().map_err(|e| anyhow::anyhow!("service error: {e:?}"))?;
+        scm_service::run(run_serve_from_service)
+            .map_err(|e| anyhow::anyhow!("service error: {e:?}"))?;
         return Ok(());
     }
     let args: Vec<String> = std::env::args().collect();
     // Version face (FLEETD-SELFUPDATE-001): works without any config — the
     // hash is baked in at build time and IS the version identity.
-    if args.iter().any(|a| a == "--version" || a == "-V" || a == "version") {
+    if args
+        .iter()
+        .any(|a| a == "--version" || a == "-V" || a == "version")
+    {
         println!("{}", scheduler::selfupdate::version_string());
         return Ok(());
     }
@@ -585,7 +589,14 @@ fn main() -> Result<()> {
     if args.get(1).map(String::as_str) == Some("tray") {
         #[cfg(target_os = "windows")]
         {
-            tray::spawn();
+            // The tray package's lib target is fleetd_tray_lib (crate
+            // resolution follows the lib name, not the package name).
+            // Same contract as the standalone tray.exe: hold the StopHandle
+            // for the whole lifetime (dropping it removes the icon and
+            // quits) and block forever — returning here would exit the
+            // process and kill the tray instantly.
+            let _stop = fleetd_tray_lib::spawn();
+            fleetd_tray_lib::wait_forever();
             return Ok(());
         }
         #[cfg(not(target_os = "windows"))]
@@ -1718,9 +1729,7 @@ fn main() -> Result<()> {
                             } else {
                                 format!(
                                     "update available{}",
-                                    c.behind_by
-                                        .map(|b| format!(" ({b})"))
-                                        .unwrap_or_default()
+                                    c.behind_by.map(|b| format!(" ({b})")).unwrap_or_default()
                                 )
                             }
                         );
@@ -1943,26 +1952,36 @@ fn run_serve_cli(args: &[String]) -> Result<()> {
             });
         });
     }
-    // 通信面(2026-11-27 钦定):本机默认走 UNIX socket(~/.fleetd/flagship.sock,
-    // Windows 同 AF_UNIX);--http 显式开启才起 TCP HTTP 面(跨机 relay/面板)。
-    // FLEETD-SERVE-001: --http keeps BOTH faces — TCP 3790 for fleet-watch /
-    // curl acceptance, the UDS face stays bound for the local tray.
+    // 通信面:unix 本机默认 UNIX socket(~/.fleetd/flagship.sock),--http 显式
+    // 开启才加 TCP HTTP 面(跨机 relay/面板);FLEETD-SERVE-001: --http keeps
+    // BOTH faces — TCP 3790 for fleet-watch / curl acceptance, the UDS face
+    // stays bound for the local tray.
+    // windows 没有 UDS 面(2026-11-28 dispatch):std windows AF_UNIX 是
+    // nightly-only,本机面就是 loopback TCP,tray 同口轮询。
     let http = args.iter().any(|a| a == "--http");
-    if http {
+    #[cfg(unix)]
+    {
         let bind = if args.iter().any(|a| a == "--public") {
             "0.0.0.0"
         } else {
             "127.0.0.1"
         };
-        let uds = scheduler::events::flagship_socket_path();
-        std::thread::spawn(move || {
-            if let Err(e) = events::serve_on_unix(&uds) {
-                eprintln!("fleetd unix socket face: {e:#}");
-            }
-        });
-        events::serve_on(bind, port)?;
-    } else {
-        events::serve_on_unix(&scheduler::events::flagship_socket_path())?;
+        if http {
+            let uds = scheduler::events::flagship_socket_path();
+            std::thread::spawn(move || {
+                if let Err(e) = events::serve_on_unix(&uds) {
+                    eprintln!("fleetd unix socket face: {e:#}");
+                }
+            });
+            events::serve_on(bind, port)?;
+        } else {
+            events::serve_on_unix(&scheduler::events::flagship_socket_path())?;
+        }
+    }
+    #[cfg(windows)]
+    {
+        let _ = http;
+        events::serve_on("127.0.0.1", port)?;
     }
     Ok(())
 }
