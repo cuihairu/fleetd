@@ -13,7 +13,7 @@
 
 use anyhow::{bail, Context, Result};
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 #[cfg(unix)]
 use std::os::unix::net::UnixListener;
 #[cfg(windows)]
@@ -280,6 +280,78 @@ pub fn handle_stream<S: Read + Write + PeerAddr>(
                 }
             }
         }
+        // Review gate face (FLEETD-SERVE-001): the GATE-001 backlog and the
+        // pass/fail decision, readable and drivable over HTTP as well as the
+        // CLI (`fleetd review ...`). Loopback gate only — the checker sits on
+        // the flagship host or reaches it through an authenticated relay.
+        Some("GET") if request_line.contains("/v1/review") => {
+            if !loopback_peer(stream) {
+                (403, r#"{"error":"loopback only"}"#.to_string())
+            } else {
+                match store::ledger::open().and_then(|c| store::ledger::review_list(&c)) {
+                    Ok(rows) => match serde_json::to_string(&rows) {
+                        Ok(j) => (200, j),
+                        Err(e) => (500, format!(r#"{{"error":"{}"}}"#, e)),
+                    },
+                    Err(e) => (500, format!(r#"{{"error":"{}"}}"#, e)),
+                }
+            }
+        }
+        Some("POST") if request_line.contains("/v1/review") => {
+            if !loopback_peer(stream) {
+                (403, r#"{"error":"loopback only"}"#.to_string())
+            } else {
+                // Same rules as the CLI: a pass must carry evidence, a fail
+                // must say what broke. Body: {id, decision, evidence, reason}.
+                match serde_json::from_str::<serde_json::Value>(&body) {
+                    Err(_) => (400, r#"{"error":"invalid json body"}"#.to_string()),
+                    Ok(v) => {
+                        let id = v.get("id").and_then(|x| x.as_i64());
+                        let decision = v.get("decision").and_then(|x| x.as_str());
+                        match (id, decision) {
+                            (Some(id), Some("pass")) => {
+                                let evidence =
+                                    v.get("evidence").and_then(|x| x.as_str()).unwrap_or("");
+                                if evidence.is_empty() {
+                                    (400, r#"{"error":"evidence required: no evidence, no done"}"#.to_string())
+                                } else {
+                                    match store::ledger::open()
+                                        .and_then(|c| store::ledger::review_pass(&c, id, evidence))
+                                    {
+                                        Ok(()) => (200, format!(r#"{{"result":"done","id":{id}}}"#)),
+                                        Err(e) => (400, format!(r#"{{"error":"{}"}}"#, e)),
+                                    }
+                                }
+                            }
+                            (Some(id), Some("fail")) => {
+                                let reason =
+                                    v.get("reason").and_then(|x| x.as_str()).unwrap_or("");
+                                if reason.is_empty() {
+                                    (400, r#"{"error":"reason required: a rejection must say what failed"}"#.to_string())
+                                } else {
+                                    match store::ledger::open()
+                                        .and_then(|c| store::ledger::review_fail(&c, id, reason))
+                                    {
+                                        Ok(escalated) => (
+                                            200,
+                                            format!(
+                                                r#"{{"result":"bounced","id":{id},"escalated":{escalated}}}"#
+                                            ),
+                                        ),
+                                        Err(e) => (400, format!(r#"{{"error":"{}"}}"#, e)),
+                                    }
+                                }
+                            }
+                            _ => (
+                                400,
+                                r#"{"error":"body must be {id, decision: pass|fail, evidence|reason}"}"#
+                                    .to_string(),
+                            ),
+                        }
+                    }
+                }
+            }
+        }
         // Presence face (FLEETD-PRESENCE-001): the reconciled liveness of
         // every tmux seat, as written by the 60 s presence watch. Loopback
         // gate only (same as /v1/status; no --public face was chartered).
@@ -292,7 +364,7 @@ pub fn handle_stream<S: Read + Write + PeerAddr>(
         // `review` (FLEETD-GATE-001) = the seat's dispatches awaiting an
         // adversarial review pass — the gate backlog, board-visible.
         Some("GET")
-            if request_line.contains("/v1/fleet")
+            if (request_line.contains("/v1/fleet") || request_line.contains("/v1/seats"))
                 && !request_line.contains("/v1/fleet/summary") =>
         {
             if !loopback_peer(stream) {

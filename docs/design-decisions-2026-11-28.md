@@ -174,3 +174,30 @@ SshMachine work-runner 双机各 1 槽，j1 本地、j2 满载改道远端、j3/
 **陷阱实录**：全新目录的信任框默认选「No, exit」，投递的 Enter 会确认退出（headless
 `-p` 预信任不落盘，run2/run3 连败）；解法=目录放已信任的 workspaces 根下+等待循环里
 见「Yes, I trust this folder」就 Down+Enter（run4 实证）。
+
+## D9. 感知面运行位上线（2026-11-28 派单 FLEETD-SERVE-001）✅
+
+四盲区定案（serve 从未运行=presence/events/review 全死数据；fleet-watch 只扫本机 tmux；
+设施面零探测；imac 服务 STOPPED 无人知）的落地单。四件套：
+- **serve 常驻**：systemd 用户单元 `Restart=always` + `RestartSec=3`（kill -9 实测 ~3s 复活）；
+  ExecStart 加 `--http`，且 run_serve_cli 改为 **TCP 3790 与 UDS 双面并存**（原实现互斥，
+  --http 会丢 tray 面已修）：TCP 面 fleet-watch/curl 用，UDS 面留给本机 tray。
+- **GATE-001 HTTP 面**：`GET /v1/review`（backlog JSON）+ `POST /v1/review`
+  （{id,decision,evidence|reason}，与 CLI 同规：pass 无证据拒、fail 无理由拒），loopback 门。
+  `/v1/seats` 作为 /v1/fleet 别名面（spec 点名可查）。
+- **infra-watch**：新 `scheduler::infra` 模块 + `fleetd infra-check` CLI，注册机清单
+  [local(3790 自检+`pgrep -x "tmux: server"`), work-runner(ssh pgrep fleetd),
+  imac(ssh `sc query FleetD`→RUNNING)]；状态文件 `~/.fleetd/infra-watch.json` 去重，
+  **只在翻转时发声**（首见 down 也算事件）：up→down 落 `infra_down`，down→up 落 `infra_up`。
+  fleetd job `fleetd-infra-watch` */5 调度。
+- **imac 真实故障根因修复**（试验中活捉）：FleetD 服务一启就崩（SCM 1067）。链路=
+  `.fleetd\` 根散落 python3.dll/python314.dll 但**无 runtime\ 捆绑目录**→configure_bundled_runtime
+  早退→PYTHONHOME 未设→exe 旁裸 python314.dll 加载后找不到 Lib\encodings→Py_Initialize
+  **直接 abort**（"pyhost init failed→回退系统 python"的优雅设计根本没机会执行——Py_Initialize
+  失败不返回错误而是杀进程）。修复=补齐 `runtime\`（python3.dll+python314.dll+Lib\+DLLs\，
+  源 scoop python 3.14.4 同源），服务即稳态 RUNNING，infra 链下账完整 down→up。
+
+**验收实录**（2026-11-28）：curl 127.0.0.1:3790/v1/fleet 活数据（seats/presence/review 计数）；
+kill -9 → ~3s 复活；imac 停服→infra_down→修复→infra_up 全链落 events 表；cargo test 全绿
+（scheduler 30 含 infra 3 测试：sc query 解析/翻转去重/注册机清单）。
+**教训**：`pgrep -x tmux` 在 Linux 永远不中——tmux server 进程 comm 是 `tmux: server`。

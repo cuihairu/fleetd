@@ -4,6 +4,7 @@
 pub mod attach;
 pub mod events;
 pub mod headless;
+pub mod infra;
 pub mod jobs;
 pub mod presence;
 pub mod pyhost;

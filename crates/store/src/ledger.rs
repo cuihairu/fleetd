@@ -532,7 +532,7 @@ pub fn progress(c: &Connection, days: u64) -> Result<Vec<SeatProgress>> {
 // --- adversarial review gate face (FLEETD-GATE-001, 2026-11-28) ---
 
 /// One dispatch awaiting (or bounced from) adversarial review.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ReviewRow {
     pub id: i64,
     pub seat: String,

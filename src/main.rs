@@ -1687,6 +1687,19 @@ fn main() -> Result<()> {
         // evidence. review list = the checker's queue; pass = land as done
         // (evidence mandatory); fail = bounce back to the seat with a
         // recorded reason (>=2 rejections escalate to the orchestrator).
+        Some("infra-check") => {
+            // One infra-watch round (FLEETD-SERVE-001): probe the registered
+            // machine list, record state changes as infra_down/infra_up
+            // events. The `fleetd-infra-watch` job calls this every 5 min.
+            let written = scheduler::infra::check_round(&scheduler::infra::state_path())?;
+            if written.is_empty() {
+                println!("infra-check: all hosts unchanged");
+            } else {
+                for (host, kind) in &written {
+                    println!("infra-check: {host} -> {kind}");
+                }
+            }
+        }
         Some("review") => {
             let c = ledger::open()?;
             let flag = |name: &str| -> Option<String> {
@@ -1799,7 +1812,7 @@ fn main() -> Result<()> {
             run_serve_cli(&args)?;
         }
         _ => {
-            println!("fleetd: dispatch <自然语言任务> | status | hosts | machines | cleanup | dispatch-file <task.md> <repo> | event <seat> | blocked | seat ... | review list|pass|fail | memory ... | serve");
+            println!("fleetd: dispatch <自然语言任务> | status | hosts | machines | cleanup | dispatch-file <task.md> <repo> | event <seat> | blocked | seat ... | review list|pass|fail | memory ... | infra-check | serve");
             status(cfg.as_ref().context("config required")?)?;
         }
     }
@@ -1868,6 +1881,8 @@ fn run_serve_cli(args: &[String]) -> Result<()> {
     }
     // 通信面(2026-11-27 钦定):本机默认走 UNIX socket(~/.fleetd/flagship.sock,
     // Windows 同 AF_UNIX);--http 显式开启才起 TCP HTTP 面(跨机 relay/面板)。
+    // FLEETD-SERVE-001: --http keeps BOTH faces — TCP 3790 for fleet-watch /
+    // curl acceptance, the UDS face stays bound for the local tray.
     let http = args.iter().any(|a| a == "--http");
     if http {
         let bind = if args.iter().any(|a| a == "--public") {
@@ -1875,6 +1890,12 @@ fn run_serve_cli(args: &[String]) -> Result<()> {
         } else {
             "127.0.0.1"
         };
+        let uds = scheduler::events::flagship_socket_path();
+        std::thread::spawn(move || {
+            if let Err(e) = events::serve_on_unix(&uds) {
+                eprintln!("fleetd unix socket face: {e:#}");
+            }
+        });
         events::serve_on(bind, port)?;
     } else {
         events::serve_on_unix(&scheduler::events::flagship_socket_path())?;
