@@ -56,6 +56,11 @@ impl Executor {
 /// call face). `socket_name` maps to tmux `-L` (None = the default socket).
 /// Errors propagate — an unreachable tmux server must never read as "no
 /// sessions" to a reconciler.
+///
+/// Unix-only: the libtmux crate itself refuses to compile on non-unix
+/// targets (`compile_error!`), so the dependency is gated in Cargo.toml and
+/// this face follows.
+#[cfg(unix)]
 pub fn tmux_session_names(socket_name: Option<&str>) -> Result<Vec<String>> {
     let mut builder = libtmux::Server::builder();
     if let Some(name) = socket_name {
@@ -94,6 +99,7 @@ mod tests {
     /// result with plain `tmux ls` output. Never touches the live seat
     /// server — zero ledger/hook side effects.
     #[test]
+    #[cfg(unix)] // libtmux dep is unix-gated in Cargo.toml (windows ci)
     fn libtmux_session_list_aligns_with_tmux_ls() {
         let sock = "fleetd-libtmux-probe";
         let run = |args: &[&str]| {
@@ -143,6 +149,7 @@ mod tests {
     /// Skips when no default server exists (CI / no seats) — the isolated
     /// probe above is the always-on evidence.
     #[test]
+    #[cfg(unix)] // libtmux dep is unix-gated in Cargo.toml (windows ci)
     fn libtmux_default_socket_matches_live_tmux_ls() {
         let ls = std::process::Command::new("tmux")
             .args(["ls", "-F", "#{session_name}"])

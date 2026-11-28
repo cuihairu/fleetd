@@ -14,6 +14,11 @@ toml.workspace = true
 rusqlite.workspace = true
 dirs.workspace = true
 schemars.workspace = true
-libtmux.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
+
+# libtmux itself refuses to build on non-unix targets (`compile_error!`), so
+# the dependency rides the unix gate; the executor face that uses it is
+# `#[cfg(unix)]` too.
+[target.'cfg(unix)'.dependencies]
+libtmux.workspace = true
