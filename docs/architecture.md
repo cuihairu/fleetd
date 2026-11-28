@@ -76,7 +76,7 @@
 ```
 
 **通信面**：
-- serve ↔ tray：`~/.fleetd/flagship.sock`（AF_UNIX，全平台；Windows 10 1803+）
+- serve ↔ tray：loopback TCP HTTP `127.0.0.1:3790`（`GET /v1/status`；2026-11-28 起 tray 不依赖 AF_UNIX，Windows 全版本可用）
 - serve ↔ 外部/跨机：`:3790` HTTP（`--http` 显式开启；跨机 relay 用）
 - ship agent ↔ flagship serve：心跳 + 领任务（relay 协议）
 - Stop hook → serve：`fleetd event`（CLI 回退）或 curl 到事件端点
@@ -159,4 +159,4 @@ core       → (无)
 | transcript 增量监听 | 无 | 无法用介质活性判断 running/idle/stuck |
 | 周期对账 | 只有 headless 模式读 stream.jsonl | interactive 席位无兜底 |
 | flagship 关 agent | 规划：`--no-agent` / 配置开关 | serve 路由分支 + 文档 |
-| tray 回退 | 已走 AF_UNIX（Windows 10 1803+） | 更旧系统回退策略待定 |
+| tray 回退 | 已走 loopback TCP HTTP（无 AF_UNIX 依赖，Windows 全版本） | 无需回退（2026-11-28 tray 改造收口） |

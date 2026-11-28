@@ -1,0 +1,43 @@
+# Windows build gate for the tray face: a tray that does not compile must
+# never reach main (2026-11-28 dispatch — the exe was never produced before,
+# so the imac had nothing to deploy). Native MSVC build + clippy + tests,
+# exe uploaded as an artifact for direct deployment.
+name: tray-windows
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "crates/tray/**"
+      - ".github/workflows/tray-windows.yml"
+  pull_request:
+    paths:
+      - "crates/tray/**"
+      - ".github/workflows/tray-windows.yml"
+
+concurrency:
+  group: tray-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy -p tray -- -D warnings
+
+      - name: Build (native msvc)
+        run: cargo build --release -p tray
+
+      - name: Test
+        run: cargo test -p tray
+
+      - name: Upload tray exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: tray-windows-msvc
+          path: target/release/tray.exe
