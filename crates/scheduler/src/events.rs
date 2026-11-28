@@ -186,14 +186,14 @@ fn read_face_peer<S: Read + Write + PeerAddr>(_stream: &S) -> bool {
     true
 }
 
-/// Agent heartbeat admission: a configured token always admits; loopback
-/// always admits (local faces never carry the token). The one change from
-/// the pre-board behavior is the fail-closed default: a remote caller with
-/// NO token configured used to pass — fine while serve was loopback-only,
-/// a hole once the board bound 0.0.0.0. Set FLEETD_RELAY_TOKEN to admit
-/// remote agents.
-fn heartbeat_admit(token_ok: bool, peer_loopback: bool) -> bool {
-    token_ok || peer_loopback
+/// Agent heartbeat admission: only a REAL token match admits a remote peer;
+/// loopback always admits (local faces never carry the token). `tokened`
+/// is false both when the header is missing and when NO token is configured
+/// — the pull channel hands out task text, so the old "open when untokened"
+/// default (fine while serve was loopback-only) is now fail-closed. Set
+/// FLEETD_RELAY_TOKEN to admit remote agents.
+fn heartbeat_admit(tokened: bool, peer_loopback: bool) -> bool {
+    tokened || peer_loopback
 }
 
 /// 泛化到 Read+Write:HTTP 解析只做读写,UnixListener/插座面同链路复用
@@ -240,17 +240,23 @@ pub fn handle_stream<S: Read + Write + PeerAddr>(
     let body = String::from_utf8_lossy(&buf[body_start..(body_start + content_len).min(buf.len())])
         .to_string();
 
-    // Relay-face auth (relay-design F5): when a token is configured, the
-    // fleet/summary GET and the heartbeat POST require it. /v1/events POST
-    // no longer bypasses the token (DASHBOARD-001 tightening): the ledger
-    // ingest is a WRITE face and is loopback-only now — hooks (the only
-    // writers) run on the flagship, and the server was loopback-bound before
-    // this change, so no remote writer ever existed to break.
-    let token_ok = relay_token.is_none()
-        || head.lines().any(|l| {
-            l.to_ascii_lowercase().starts_with("authorization:")
-                && l.contains(relay_token.unwrap_or(""))
-        });
+    // Relay-face auth (relay-design F5). Two different admission semantics
+    // share one header check:
+    // - `token_ok` (fleet/summary GET): a READ face, open when no token is
+    //   configured at all.
+    // - `heartbeat_tokened` (agent heartbeat POST, DASHBOARD-001): the pull
+    //   channel hands out task text, so "no token configured" must NOT mean
+    //   open — it fails closed to loopback (see heartbeat_admit).
+    // /v1/events POST is loopback-only regardless of tokens (DASHBOARD-001
+    // tightening): hooks (the only writers) run on the flagship, and the
+    // server was loopback-bound before this change, so no remote writer
+    // ever existed to break.
+    let auth_header_ok = head.lines().any(|l| {
+        l.to_ascii_lowercase().starts_with("authorization:")
+            && l.contains(relay_token.unwrap_or(""))
+    });
+    let token_ok = relay_token.is_none() || auth_header_ok;
+    let heartbeat_tokened = relay_token.is_some() && auth_header_ok;
 
     let (status, payload) = match request_line.split_whitespace().next() {
         Some("POST") if request_line.contains("/v1/events") => {
@@ -270,7 +276,7 @@ pub fn handle_stream<S: Read + Write + PeerAddr>(
         // closed to loopback (DASHBOARD-001: the board's 0.0.0.0 bind must
         // not silently open the pull channel).
         Some("POST") if request_line.contains("/v1/agent/heartbeat") => {
-            if !heartbeat_admit(token_ok, loopback_peer(stream)) {
+            if !heartbeat_admit(heartbeat_tokened, loopback_peer(stream)) {
                 (403, r#"{"error":"forbidden"}"#.to_string())
             } else {
                 match relay::relay::heartbeat(&body) {
@@ -741,14 +747,12 @@ mod tests {
 
     #[test]
     fn heartbeat_admits_by_token_or_loopback_only() {
-        // Token configured: only token holders (loopback without it is still
-        // admitted — local faces never carry the token).
+        // `tokened` is the REAL header match (false when the header is
+        // missing OR no token is configured): only it admits a remote peer.
         assert!(heartbeat_admit(true, false), "tokened remote agent");
         assert!(heartbeat_admit(true, true));
         assert!(!heartbeat_admit(false, false), "untokened remote refused");
-        // No token configured (token_ok=false for everyone): fail closed to
-        // loopback — the pull channel is not web-readable.
+        // Loopback passes even without any token (local faces).
         assert!(heartbeat_admit(false, true), "loopback still works");
-        assert!(!heartbeat_admit(false, false), "no-token remote refused");
     }
 }
