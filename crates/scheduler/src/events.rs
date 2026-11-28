@@ -53,9 +53,8 @@ pub fn ingest_and_dispatch(raw: &str, auto: bool) -> Result<(String, String)> {
     let blocked = ev.blocked.unwrap_or(0);
     let dirty = ev.dirty.unwrap_or(0);
     // No queued tag source yet (queue lands later); nudge todo when open.
-    let decision = fleetd_core::dispatcher::decide(
-        v, open, blocked, None, dirty, true, true, false,
-    );
+    let decision =
+        fleetd_core::dispatcher::decide(v, open, blocked, None, dirty, true, true, false);
     let summary = match &decision {
         fleetd_core::dispatcher::Decision::Noop { reason } => format!("noop: {reason}"),
         _ => format!("would: {:?}", decision),
@@ -92,7 +91,10 @@ impl PeerAddr for std::os::windows::net::UnixStream {
 
 /// 泛化到 Read+Write:HTTP 解析只做读写,UnixListener/插座面同链路复用
 /// (2026-11-27 UNIX socket 默认面拆分)。
-pub fn handle_stream<S: Read + Write + PeerAddr>(stream: &mut S, relay_token: Option<&str>) -> Result<()> {
+pub fn handle_stream<S: Read + Write + PeerAddr>(
+    stream: &mut S,
+    relay_token: Option<&str>,
+) -> Result<()> {
     let mut buf = Vec::with_capacity(8192);
     let mut tmp = [0u8; 4096];
     let header_end;
@@ -136,12 +138,10 @@ pub fn handle_stream<S: Read + Write + PeerAddr>(stream: &mut S, relay_token: Op
     // open for the loopback hook path (hooks run on the flagship itself).
     let token_ok = relay_token.is_none()
         || request_line.contains("/v1/events")
-        || head
-            .lines()
-            .any(|l| {
-                l.to_ascii_lowercase().starts_with("authorization:")
-                    && l.contains(relay_token.unwrap_or(""))
-            });
+        || head.lines().any(|l| {
+            l.to_ascii_lowercase().starts_with("authorization:")
+                && l.contains(relay_token.unwrap_or(""))
+        });
 
     let (status, payload) = match request_line.split_whitespace().next() {
         Some("POST") if request_line.contains("/v1/events") => match ingest(&body) {
@@ -207,6 +207,62 @@ pub fn handle_stream<S: Read + Write + PeerAddr>(stream: &mut S, relay_token: Op
                 )
             }
         }
+        // Presence face (FLEETD-PRESENCE-001): the reconciled liveness of
+        // every tmux seat, as written by the 60 s presence watch. Loopback
+        // gate only (same as /v1/status; no --public face was chartered).
+        // `?state=<name>` narrows to one state, e.g. ?state=blocked-style
+        // dashboards ask for ?state=idle. `last_commit` = newest lifecycle
+        // event ts for the seat from the ledger.
+        Some("GET")
+            if request_line.contains("/v1/fleet")
+                && !request_line.contains("/v1/fleet/summary") =>
+        {
+            let peer = PeerAddr::peer_addr(stream)
+                .ok()
+                .flatten()
+                .map(|a| a.ip().is_loopback())
+                .unwrap_or(true);
+            if !peer {
+                (403, r#"{"error":"loopback only"}"#.to_string())
+            } else {
+                let state_filter = request_line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("")
+                    .split_once('?')
+                    .map(|(_, q)| {
+                        q.split('&')
+                            .find_map(|kv| kv.strip_prefix("state="))
+                            .unwrap_or("")
+                            .to_string()
+                    })
+                    .unwrap_or_default();
+                match store::ledger::open()
+                    .and_then(|c| store::ledger::presence_rows(&c, &state_filter))
+                {
+                    Ok(rows) => {
+                        let arr: Vec<serde_json::Value> = rows
+                            .iter()
+                            .map(|r| {
+                                serde_json::json!({
+                                    "seat": r.seat,
+                                    "state": r.state,
+                                    "open": r.open,
+                                    "blocked": r.blocked,
+                                    "last_event_ts": r.last_event_ts,
+                                    "last_commit": r.last_commit,
+                                })
+                            })
+                            .collect();
+                        match serde_json::to_string(&arr) {
+                            Ok(j) => (200, j),
+                            Err(e) => (500, format!(r#"{{"error":"{}"}}"#, e)),
+                        }
+                    }
+                    Err(e) => (500, format!(r#"{{"error":"{}"}}"#, e)),
+                }
+            }
+        }
         _ => (404, r#"{"error":"not found"}"#.to_string()),
     };
     let resp = format!(
@@ -230,13 +286,15 @@ fn find_double_crlf(buf: &[u8]) -> Option<usize> {
 /// 每次 bind 前清残留 socket 文件。
 #[cfg(unix)]
 pub fn serve_on_unix(sock_path: &std::path::Path) -> Result<()> {
-    let relay_token = std::env::var("FLEETD_RELAY_TOKEN").ok().filter(|t| !t.is_empty());
+    let relay_token = std::env::var("FLEETD_RELAY_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty());
     if let Some(dir) = sock_path.parent() {
         std::fs::create_dir_all(dir).with_context(|| "create socket dir")?;
     }
     let _ = std::fs::remove_file(sock_path); // stale socket from a crashed run
-    let listener = UnixListener::bind(sock_path)
-        .with_context(|| format!("bind unix socket {sock_path:?}"))?;
+    let listener =
+        UnixListener::bind(sock_path).with_context(|| format!("bind unix socket {sock_path:?}"))?;
     eprintln!("fleetd flagship socket: {sock_path:?} (local tray face)");
     for stream in listener.incoming() {
         match stream {
@@ -254,13 +312,15 @@ pub fn serve_on_unix(sock_path: &std::path::Path) -> Result<()> {
 /// Windows 侧 AF_UNIX 面(签名一致;Windows 10 1803+ 支持)。
 #[cfg(windows)]
 pub fn serve_on_unix(sock_path: &std::path::Path) -> Result<()> {
-    let relay_token = std::env::var("FLEETD_RELAY_TOKEN").ok().filter(|t| !t.is_empty());
+    let relay_token = std::env::var("FLEETD_RELAY_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty());
     if let Some(dir) = sock_path.parent() {
         std::fs::create_dir_all(dir).with_context(|| "create socket dir")?;
     }
     let _ = std::fs::remove_file(sock_path);
-    let listener = UnixListener::bind(sock_path)
-        .with_context(|| format!("bind unix socket {sock_path:?}"))?;
+    let listener =
+        UnixListener::bind(sock_path).with_context(|| format!("bind unix socket {sock_path:?}"))?;
     eprintln!("fleetd flagship socket: {sock_path:?} (local tray face)");
     for stream in listener.incoming() {
         match stream {
@@ -280,11 +340,15 @@ pub fn flagship_socket_path() -> std::path::PathBuf {
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .unwrap_or_else(|_| ".".into());
-    std::path::Path::new(&home).join(".fleetd").join("flagship.sock")
+    std::path::Path::new(&home)
+        .join(".fleetd")
+        .join("flagship.sock")
 }
 
 pub fn serve_on(bind_addr: &str, port: u16) -> Result<()> {
-    let relay_token = std::env::var("FLEETD_RELAY_TOKEN").ok().filter(|t| !t.is_empty());
+    let relay_token = std::env::var("FLEETD_RELAY_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty());
     if relay_token.is_some() && bind_addr != "127.0.0.1" {
         eprintln!(
             "fleetd relay face: http://{bind_addr}:{port}/v1/agent/heartbeat + /v1/fleet/summary (token required)"

@@ -6,6 +6,7 @@
 pub mod agent;
 pub mod config;
 pub mod dispatcher;
+pub mod presence;
 pub mod schedule;
 pub mod topology;
 pub mod verdict;

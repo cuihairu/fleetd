@@ -10,21 +10,21 @@ use fleetd_core::config::{FleetConfig, Host};
 // sites keep their short paths — the split moves boundaries only.
 use agent::agent_loop;
 use fleetd_core::topology;
-use report::{fleet_view, summary};
-use store::ledger;
 use probe::probe;
-use store::resources;
+use report::{fleet_view, summary};
 use scheduler::jobs;
+use scheduler::{events, headless, presence, pyhost};
 #[cfg(target_os = "windows")]
 use service::scm_service;
-use scheduler::{events, headless, pyhost};
+use store::ledger;
+use store::resources;
 // The `scheduler` submodule must NOT be imported under its own name: it
 // shadows the crate, making every `scheduler::jobs` resolve to the module.
-use scheduler::scheduler as sched;
-use service as svc;
 use mcp::mcp_server;
 use mcp::tools;
 use rusqlite::Connection;
+use scheduler::scheduler as sched;
+use service as svc;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -506,9 +506,93 @@ fn main() -> Result<()> {
                             }
                         }
                     }
-                    println!("FLEET: fired={} stalled={} (self + pulled ships)", total_fired, total_stalled);
+                    println!(
+                        "FLEET: fired={} stalled={} (self + pulled ships)",
+                        total_fired, total_stalled
+                    );
                 }
-                _ => println!("fleetd fleet: ships | pull | status"),
+                _ => {
+                    // Presence face (FLEETD-PRESENCE-001): live seat
+                    // classification, same verdicts the 60 s reconciler
+                    // writes into the presence table — drop-in replacement
+                    // for the orchestrator's temporary seat_state.py.
+                    // Enumerate workspace dirs (python-parity seat set).
+                    // A seat is a GIT REPO under workspaces (has .git) — dot
+                    // dirs (.cache/.claude/...), tmp scratch trees (\tmp\...,
+                    // leftovers from a windows run) and non-repo folders are
+                    // not seats and never appear in the table.
+                    let root = Path::new("/home/cui/workspaces");
+                    let mut seats: Vec<String> = std::fs::read_dir(root)
+                        .map(|rd| {
+                            rd.flatten()
+                                .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                                .filter(|e| e.path().join(".git").exists())
+                                // worktree checkouts (worktrees/<name>) are
+                                // lane copies, not seats: skip anything that
+                                // has a sibling -wt- suffix or lives under a
+                                // known reference/vendored name
+                                .filter(|e| {
+                                    let binding = e.file_name();
+                                    let n = binding.to_string_lossy();
+                                    // worktree checkouts (croupier-wt-*,
+                                    // kode-fixverify, rillane-gate, ...) are
+                                    // lane copies of a seat's repo — a lane
+                                    // without its own session is "no seat";
+                                    // they only surface when their session
+                                    // is live. Reference/scratch repos
+                                    // (brimdeck-ref, cpython, go, pa6-probe,
+                                    // venue-seats) are never seats.
+                                    !n.contains("-wt-")
+                                        && !n.contains("-lane-")
+                                        && n != "croupier-sui-reland"
+                                        && !n.ends_with("-gate")
+                                        && !n.contains("fixverify")
+                                        && !n.contains("-t44")
+                                        && !n.contains("-t45")
+                                        && n != "brimdeck-ref"
+                                        && n != "cpython"
+                                        && n != "go"
+                                        && n != "pa6-probe"
+                                        && n != "venue-seats"
+                                })
+                                .map(|e| e.file_name().to_string_lossy().to_string())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    seats.sort();
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs_f64())
+                        .unwrap_or_default();
+                    println!(
+                        "{:<24} {:<9} {:<5} {:<8} {:<10} {}",
+                        "seat", "state", "open", "blocked", "last", "signal"
+                    );
+                    let mut fire_candidate = false;
+                    for seat in &seats {
+                        let (state, ev, _) = presence::classify_seat(seat, now);
+                        let (open, blocked) = fleetd_core::presence::todo_counts(seat);
+                        if state == fleetd_core::presence::State::Idle && open > 0 {
+                            fire_candidate = true;
+                        }
+                        let last = ev
+                            .last_event_age
+                            .map(|a| format!("{a:.0}s"))
+                            .unwrap_or_else(|| "-".into());
+                        println!(
+                            "{:<24} {:<9} {:<5} {:<8} {:<10} {}",
+                            seat,
+                            state.as_str(),
+                            open,
+                            blocked,
+                            last,
+                            ev.signal
+                        );
+                    }
+                    // Exit-code parity with seat_state.py: 0 when some IDLE
+                    // seat has open todos (fire candidates exist).
+                    std::process::exit(if fire_candidate { 0 } else { 1 });
+                }
             }
         }
         // --- resource plane (hosts/tools/devices facts) ---
@@ -1139,11 +1223,18 @@ fn run_serve_cli(args: &[String]) -> Result<()> {
             });
         });
     }
+    // Presence watch (FLEETD-PRESENCE-001): reconcile seat liveness into the
+    // presence table every 60 s, independent of the job scheduler flag.
+    std::thread::spawn(|| scheduler::presence::watch_forever());
     // 通信面(2026-11-27 钦定):本机默认走 UNIX socket(~/.fleetd/flagship.sock,
     // Windows 同 AF_UNIX);--http 显式开启才起 TCP HTTP 面(跨机 relay/面板)。
     let http = args.iter().any(|a| a == "--http");
     if http {
-        let bind = if args.iter().any(|a| a == "--public") { "0.0.0.0" } else { "127.0.0.1" };
+        let bind = if args.iter().any(|a| a == "--public") {
+            "0.0.0.0"
+        } else {
+            "127.0.0.1"
+        };
         events::serve_on(bind, port)?;
     } else {
         events::serve_on_unix(&scheduler::events::flagship_socket_path())?;

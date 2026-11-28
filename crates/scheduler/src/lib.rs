@@ -4,8 +4,8 @@
 pub mod events;
 pub mod headless;
 pub mod jobs;
+pub mod presence;
 pub mod pyhost;
 pub mod scheduler;
-// Windows SCM face is windows-only (the SCM protocol exists only there).
-#[cfg(target_os = "windows")]
-pub mod scm_service;
+// The Windows SCM face moved to the `service` crate with the 2026-11-27
+// split; it is declared there (cfg-gated), not here.

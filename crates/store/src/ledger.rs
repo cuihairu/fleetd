@@ -9,7 +9,7 @@
 //! stalled (HEAD unchanged, dirty) / interrupted (stop without progress).
 
 use anyhow::{Context, Result};
-use fleetd_core::verdict::{classify, Verdict, SeatEvent};
+use fleetd_core::verdict::{classify, SeatEvent, Verdict};
 use rusqlite::{Connection, OptionalExtension};
 use std::path::PathBuf;
 
@@ -98,7 +98,18 @@ pub fn open() -> Result<Connection> {
             dirty_at_finish INTEGER,
             note TEXT
          );
-         CREATE INDEX IF NOT EXISTS idx_dispatch_seat ON dispatches(seat, fired_at DESC);",
+         CREATE INDEX IF NOT EXISTS idx_dispatch_seat ON dispatches(seat, fired_at DESC);
+         CREATE TABLE IF NOT EXISTS presence (
+            seat TEXT PRIMARY KEY,
+            state TEXT NOT NULL,
+            transcript_path TEXT,
+            last_event_ts INTEGER,
+            last_output_ts INTEGER,
+            pending_tool_use INTEGER,
+            open_todos INTEGER,
+            blocked_todos INTEGER,
+            updated_at INTEGER NOT NULL
+         );",
     )?;
     // Seat-control gate migration (2026-11-26 falcon incident): disabled
     // seats must be skipped by every auto-start path. ALTER with tolerance
@@ -116,9 +127,6 @@ fn default_kind() -> String {
 
 /// Verdict of an event against the seat's in-flight dispatch baseline.
 /// Pure classification moved to fleetd_core::verdict (2026-11-27 crate split).
-
-
-
 
 /// Seat-control gate: a disabled seat must be skipped by every auto-start
 /// path (idle-watch, fire, agent heartbeat, patrol resume). Set by
@@ -169,7 +177,10 @@ pub fn inflight(c: &Connection, seat: &str) -> Result<Option<(i64, String, Optio
 /// Kinds that carry a terminal state worth classifying a dispatch against.
 /// notification/compact are observational — they must NOT close a dispatch.
 fn is_terminal_kind(kind: &str) -> bool {
-    matches!(kind, "stop" | "session_end" | "subagent_stop" | "teammate_idle")
+    matches!(
+        kind,
+        "stop" | "session_end" | "subagent_stop" | "teammate_idle"
+    )
 }
 
 /// Ingest the event, classify against the in-flight dispatch, close it out.
@@ -333,7 +344,11 @@ mod tests {
              CREATE TABLE events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 ts INTEGER NOT NULL, seat TEXT NOT NULL, head TEXT,
-                open_count INTEGER, dirty_count INTEGER, kind TEXT, verdict TEXT);",
+                open_count INTEGER, dirty_count INTEGER, kind TEXT, verdict TEXT);
+             CREATE TABLE presence (
+                seat TEXT PRIMARY KEY, state TEXT NOT NULL, transcript_path TEXT,
+                last_event_ts INTEGER, last_output_ts INTEGER, pending_tool_use INTEGER,
+                open_todos INTEGER, blocked_todos INTEGER, updated_at INTEGER NOT NULL);",
         )
         .unwrap();
         c
@@ -395,24 +410,52 @@ mod tests {
         let c = mem();
         record_dispatch(&c, "kode", "t1", Some("aaa")).unwrap();
         // notification kind must be recorded but leave dispatch in-flight
-        let v = ingest(&c, &SeatEvent {
-            seat: "kode".into(), head: Some("bbb".into()), open: Some(1), blocked: Some(0),
-            dirty: Some(0), kind: "observational".into(),
-        }).unwrap();
+        let v = ingest(
+            &c,
+            &SeatEvent {
+                seat: "kode".into(),
+                head: Some("bbb".into()),
+                open: Some(1),
+                blocked: Some(0),
+                dirty: Some(0),
+                kind: "observational".into(),
+            },
+        )
+        .unwrap();
         assert_eq!(v, Verdict::Untracked);
-        let (finished, outcome): (Option<i64>, Option<String>) = c.query_row(
-            "SELECT finished_at, outcome FROM dispatches WHERE seat='kode'", [],
-            |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
-        assert!(finished.is_none(), "observational event must NOT close dispatch");
+        let (finished, outcome): (Option<i64>, Option<String>) = c
+            .query_row(
+                "SELECT finished_at, outcome FROM dispatches WHERE seat='kode'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(
+            finished.is_none(),
+            "observational event must NOT close dispatch"
+        );
         assert!(outcome.is_none());
         // terminal stop now closes it correctly
-        let v2 = ingest(&c, &SeatEvent {
-            seat: "kode".into(), head: Some("bbb".into()), open: Some(1), blocked: Some(0),
-            dirty: Some(0), kind: "stop".into(),
-        }).unwrap();
+        let v2 = ingest(
+            &c,
+            &SeatEvent {
+                seat: "kode".into(),
+                head: Some("bbb".into()),
+                open: Some(1),
+                blocked: Some(0),
+                dirty: Some(0),
+                kind: "stop".into(),
+            },
+        )
+        .unwrap();
         assert_eq!(v2, Verdict::Completed);
-        let outcome2: String = c.query_row(
-            "SELECT outcome FROM dispatches WHERE seat='kode'", [], |r| r.get(0)).unwrap();
+        let outcome2: String = c
+            .query_row(
+                "SELECT outcome FROM dispatches WHERE seat='kode'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(outcome2, "completed");
     }
 
@@ -452,6 +495,128 @@ mod tests {
         assert_eq!(rows[0].completed, 1);
         assert_eq!(rows[0].stalled, 1);
     }
+
+    #[test]
+    fn presence_upsert_and_filter_roundtrip() {
+        let c = mem();
+        presence_upsert(
+            &c,
+            "kode",
+            "active",
+            Some("/t/kode.jsonl"),
+            Some(111),
+            Some(112),
+            false,
+            3,
+            1,
+            200,
+        )
+        .unwrap();
+        presence_upsert(&c, "courier", "idle", None, None, None, true, 0, 0, 201).unwrap();
+        // Upsert overwrites in place (no duplicate rows).
+        presence_upsert(
+            &c,
+            "kode",
+            "stuck",
+            Some("/t/kode.jsonl"),
+            Some(150),
+            Some(150),
+            true,
+            3,
+            1,
+            300,
+        )
+        .unwrap();
+        let all = presence_rows(&c, "").unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].seat, "courier"); // seat order
+        let kode = all.iter().find(|r| r.seat == "kode").unwrap();
+        assert_eq!(kode.state, "stuck");
+        assert_eq!(kode.open, 3);
+        assert_eq!(kode.blocked, 1);
+        assert_eq!(kode.last_event_ts, Some(150));
+        // State filter narrows to matching rows only.
+        let idle = presence_rows(&c, "idle").unwrap();
+        assert_eq!(idle.len(), 1);
+        assert_eq!(idle[0].seat, "courier");
+        assert_eq!(idle[0].last_commit, None);
+        assert_eq!(presence_rows(&c, "gone").unwrap().len(), 0);
+    }
+}
+
+/// One presence row (FLEETD-PRESENCE-001): current liveness of a seat as
+/// reconciled from its transcript tail and pane capture.
+#[derive(Debug, Clone)]
+pub struct PresenceRow {
+    pub seat: String,
+    pub state: String,
+    pub open: i64,
+    pub blocked: i64,
+    pub last_event_ts: Option<i64>,
+    pub last_commit: Option<i64>,
+}
+
+/// Upsert one reconciled presence row. All signals are passed by the caller
+/// (the scheduler owns tmux/transcript IO); this function only persists.
+#[allow(clippy::too_many_arguments)]
+pub fn presence_upsert(
+    c: &Connection,
+    seat: &str,
+    state: &str,
+    transcript_path: Option<&str>,
+    last_event_ts: Option<i64>,
+    last_output_ts: Option<i64>,
+    pending_tool_use: bool,
+    open_todos: i64,
+    blocked_todos: i64,
+    updated_at: i64,
+) -> Result<()> {
+    c.execute(
+        "INSERT INTO presence (seat, state, transcript_path, last_event_ts,
+             last_output_ts, pending_tool_use, open_todos, blocked_todos, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+         ON CONFLICT(seat) DO UPDATE SET
+             state=excluded.state, transcript_path=excluded.transcript_path,
+             last_event_ts=excluded.last_event_ts, last_output_ts=excluded.last_output_ts,
+             pending_tool_use=excluded.pending_tool_use, open_todos=excluded.open_todos,
+             blocked_todos=excluded.blocked_todos, updated_at=excluded.updated_at",
+        rusqlite::params![
+            seat,
+            state,
+            transcript_path,
+            last_event_ts,
+            last_output_ts,
+            i64::from(pending_tool_use),
+            open_todos,
+            blocked_todos,
+            updated_at
+        ],
+    )?;
+    Ok(())
+}
+
+/// Read presence rows in seat order. `state` filters when non-empty.
+/// `last_commit` comes from the most recent event for that seat (the ledger
+/// already records lifecycle events there), not from transcript IO.
+pub fn presence_rows(c: &Connection, state_filter: &str) -> Result<Vec<PresenceRow>> {
+    let mut st = c.prepare(
+        "SELECT p.seat, p.state, p.open_todos, p.blocked_todos, p.last_event_ts,
+                (SELECT MAX(e.ts) FROM events e WHERE e.seat = p.seat) AS last_commit
+         FROM presence p
+         WHERE (?1 = '' OR p.state = ?1)
+         ORDER BY p.seat",
+    )?;
+    let rows = st.query_map([state_filter], |r| {
+        Ok(PresenceRow {
+            seat: r.get(0)?,
+            state: r.get(1)?,
+            open: r.get(2)?,
+            blocked: r.get(3)?,
+            last_event_ts: r.get(4)?,
+            last_commit: r.get(5)?,
+        })
+    })?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
 }
 
 /// Dispatches fired but not yet finished — the "is fleetd working" signal
