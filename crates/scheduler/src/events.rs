@@ -186,6 +186,16 @@ fn read_face_peer<S: Read + Write + PeerAddr>(_stream: &S) -> bool {
     true
 }
 
+/// Agent heartbeat admission: a configured token always admits; loopback
+/// always admits (local faces never carry the token). The one change from
+/// the pre-board behavior is the fail-closed default: a remote caller with
+/// NO token configured used to pass — fine while serve was loopback-only,
+/// a hole once the board bound 0.0.0.0. Set FLEETD_RELAY_TOKEN to admit
+/// remote agents.
+fn heartbeat_admit(token_ok: bool, peer_loopback: bool) -> bool {
+    token_ok || peer_loopback
+}
+
 /// 泛化到 Read+Write:HTTP 解析只做读写,UnixListener/插座面同链路复用
 /// (2026-11-27 UNIX socket 默认面拆分)。
 pub fn handle_stream<S: Read + Write + PeerAddr>(
@@ -255,9 +265,12 @@ pub fn handle_stream<S: Read + Write + PeerAddr>(
         }
         // Agent heartbeat (relay F2): ships behind NAT/unstable networks
         // POST {seat, head, dirty} on an outbound timer; the response
-        // carries pending pull-dispatches. Auth: relay token (F5).
+        // carries pending pull-dispatches (task text — not web-readable).
+        // Auth: relay token (F5); with no token configured the face fails
+        // closed to loopback (DASHBOARD-001: the board's 0.0.0.0 bind must
+        // not silently open the pull channel).
         Some("POST") if request_line.contains("/v1/agent/heartbeat") => {
-            if !token_ok {
+            if !heartbeat_admit(token_ok, loopback_peer(stream)) {
                 (403, r#"{"error":"forbidden"}"#.to_string())
             } else {
                 match relay::relay::heartbeat(&body) {
@@ -673,6 +686,11 @@ pub fn serve_on(bind_addr: &str, port: u16) -> Result<()> {
             "fleetd relay face: http://{bind_addr}:{port}/v1/agent/heartbeat + /v1/fleet/summary (token required)"
         );
     }
+    if relay_token.is_none() && bind_addr != "127.0.0.1" {
+        eprintln!(
+            "fleetd relay face: no FLEETD_RELAY_TOKEN set; /v1/agent/heartbeat is loopback-only (set the token to admit remote agents)"
+        );
+    }
     let listener =
         TcpListener::bind((bind_addr, port)).with_context(|| format!("bind {bind_addr}:{port}"))?;
     eprintln!("fleetd event endpoint: http://{bind_addr}:{port}/v1/events");
@@ -719,5 +737,18 @@ mod tests {
     #[test]
     fn rejects_malformed_json() {
         assert!(parse_body("{not json").is_err());
+    }
+
+    #[test]
+    fn heartbeat_admits_by_token_or_loopback_only() {
+        // Token configured: only token holders (loopback without it is still
+        // admitted — local faces never carry the token).
+        assert!(heartbeat_admit(true, false), "tokened remote agent");
+        assert!(heartbeat_admit(true, true));
+        assert!(!heartbeat_admit(false, false), "untokened remote refused");
+        // No token configured (token_ok=false for everyone): fail closed to
+        // loopback — the pull channel is not web-readable.
+        assert!(heartbeat_admit(false, true), "loopback still works");
+        assert!(!heartbeat_admit(false, false), "no-token remote refused");
     }
 }
