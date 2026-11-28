@@ -46,6 +46,19 @@ pub struct JobNameQuery {
     pub name: Option<String>,
 }
 
+#[derive(Deserialize, serde::Serialize, rmcp::schemars::JsonSchema)]
+pub struct MemoryQuery {
+    /// Filter by owning seat; omit to include every seat plus global notes.
+    #[serde(default)]
+    pub seat: Option<String>,
+    /// Filter by tag (blocker / decision / credgap / ...).
+    #[serde(default)]
+    pub tag: Option<String>,
+    /// Max rows (default 20).
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
 impl FleetMcp {
     pub fn new() -> Self {
         Self {
@@ -224,6 +237,43 @@ impl FleetMcp {
             Ok(_) => format!("job removed: {:?}", query.name),
             Err(e) => format!("remove error: {e}"),
         }
+    }
+
+    /// Query fleet-memory notes (docs/agent-support.md §4.2): convention-keyed
+    /// notes any writer can attach, e.g. `seat:<name>:blocked`. Read-only —
+    /// writes go through the CLI / PUT face.
+    #[tool(
+        name = "fleet_memory_query",
+        description = "Query fleet-memory notes (convention keys like seat:<name>:blocked, tags like blocker/decision). Read-only; seat/tag/limit all optional."
+    )]
+    pub async fn fleet_memory_query(&self, Parameters(query): Parameters<MemoryQuery>) -> String {
+        let c = match store::ledger::open() {
+            Ok(c) => c,
+            Err(e) => return format!("ledger error: {e}"),
+        };
+        let rows = match store::ledger::memory_list(
+            &c,
+            query.seat.as_deref().filter(|s| !s.is_empty()),
+            query.tag.as_deref().filter(|s| !s.is_empty()),
+            query.limit.unwrap_or(20).clamp(1, 500) as i64,
+        ) {
+            Ok(r) => r,
+            Err(e) => return format!("memory query error: {e}"),
+        };
+        let arr: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "key": r.key,
+                    "seat": r.seat,
+                    "tag": r.tag,
+                    "content": r.content,
+                    "source": r.source,
+                    "updated_at": r.updated_at,
+                })
+            })
+            .collect();
+        serde_json::to_string(&arr).unwrap_or_else(|e| format!("serialize error: {e}"))
     }
 }
 

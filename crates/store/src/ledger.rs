@@ -109,7 +109,20 @@ pub fn open() -> Result<Connection> {
             open_todos INTEGER,
             blocked_todos INTEGER,
             updated_at INTEGER NOT NULL
-         );",
+         );
+         CREATE TABLE IF NOT EXISTS memory (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            key TEXT NOT NULL,
+            seat TEXT,
+            tag TEXT,
+            content TEXT NOT NULL,
+            source TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            UNIQUE(key)
+         );
+         CREATE INDEX IF NOT EXISTS idx_memory_seat ON memory(seat);
+         CREATE INDEX IF NOT EXISTS idx_memory_tag ON memory(tag);",
     )?;
     // Seat-control gate migration (2026-11-26 falcon incident): disabled
     // seats must be skipped by every auto-start path. ALTER with tolerance
@@ -352,7 +365,12 @@ mod tests {
              CREATE TABLE presence (
                 seat TEXT PRIMARY KEY, state TEXT NOT NULL, transcript_path TEXT,
                 last_event_ts INTEGER, last_output_ts INTEGER, pending_tool_use INTEGER,
-                open_todos INTEGER, blocked_todos INTEGER, updated_at INTEGER NOT NULL);",
+                open_todos INTEGER, blocked_todos INTEGER, updated_at INTEGER NOT NULL);
+             CREATE TABLE memory (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT NOT NULL,
+                seat TEXT, tag TEXT, content TEXT NOT NULL, source TEXT,
+                created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+                UNIQUE(key));",
         )
         .unwrap();
         c
@@ -583,6 +601,126 @@ mod tests {
         assert_eq!(idle[0].last_commit, None);
         assert_eq!(presence_rows(&c, "gone").unwrap().len(), 0);
     }
+
+    fn put_blocker(c: &Connection, seat: &str, key: &str, content: &str) {
+        memory_put(c, key, Some(seat), Some("blocker"), content, Some("fleetd")).unwrap();
+    }
+
+    #[test]
+    fn memory_put_get_roundtrip() {
+        let c = mem();
+        put_blocker(&c, "kode", "seat:kode:blocked", "winpkg sign-tool missing");
+        let row = memory_get(&c, "seat:kode:blocked").unwrap().unwrap();
+        assert_eq!(row.seat.as_deref(), Some("kode"));
+        assert_eq!(row.tag.as_deref(), Some("blocker"));
+        assert_eq!(row.content, "winpkg sign-tool missing");
+        assert_eq!(row.source.as_deref(), Some("fleetd"));
+        assert_eq!(row.created_at, row.updated_at, "first write stamps both");
+        assert!(memory_get(&c, "no-such-key").unwrap().is_none());
+    }
+
+    #[test]
+    fn memory_put_upsert_overwrites_and_keeps_created_at() {
+        let c = mem();
+        put_blocker(&c, "kode", "k1", "old content");
+        let first = memory_get(&c, "k1").unwrap().unwrap();
+        // Sleep-free determinism: rewrite through the API, then compare.
+        memory_put(
+            &c,
+            "k1",
+            None,
+            Some("decision"),
+            "new content",
+            Some("hermes"),
+        )
+        .unwrap();
+        let second = memory_get(&c, "k1").unwrap().unwrap();
+        assert_eq!(second.content, "new content");
+        assert_eq!(second.seat, None, "upsert replaces seat too");
+        assert_eq!(second.tag.as_deref(), Some("decision"));
+        assert_eq!(second.source.as_deref(), Some("hermes"));
+        assert_eq!(
+            second.created_at, first.created_at,
+            "created_at stays first-write"
+        );
+        let n: i64 = c
+            .query_row("SELECT COUNT(*) FROM memory WHERE key='k1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(n, 1, "UNIQUE(key): upsert must not duplicate rows");
+    }
+
+    #[test]
+    fn memory_list_filters_by_seat_and_tag() {
+        let c = mem();
+        put_blocker(&c, "apollo", "seat:apollo:blocked", "apollo stuck");
+        put_blocker(&c, "atlas", "seat:atlas:blocked", "atlas stuck");
+        memory_put(
+            &c,
+            "global:freeze",
+            None,
+            Some("decision"),
+            "freeze week",
+            None,
+        )
+        .unwrap();
+        let apollo = memory_list(&c, Some("apollo"), None, 50).unwrap();
+        assert_eq!(apollo.len(), 1);
+        assert_eq!(apollo[0].key, "seat:apollo:blocked");
+        let blockers = memory_list(&c, None, Some("blocker"), 50).unwrap();
+        assert_eq!(blockers.len(), 2);
+        let decisions = memory_list(&c, None, Some("decision"), 50).unwrap();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].key, "global:freeze");
+        // Seat filter excludes the global NULL-seat note.
+        assert!(memory_list(&c, Some("apollo"), Some("decision"), 50)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn memory_list_orders_by_updated_desc_and_limits() {
+        let c = mem();
+        put_blocker(&c, "a", "k-a", "a");
+        put_blocker(&c, "b", "k-b", "b");
+        put_blocker(&c, "c", "k-c", "c");
+        // Stamp distinct updated_at values: same-second writes would make
+        // the DESC order ambiguous.
+        for (key, ts) in [("k-a", 100), ("k-c", 90), ("k-b", 80)] {
+            c.execute(
+                "UPDATE memory SET updated_at=?1 WHERE key=?2",
+                rusqlite::params![ts, key],
+            )
+            .unwrap();
+        }
+        let rows = memory_list(&c, None, None, 2).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].key, "k-a", "most recently updated first");
+        assert_eq!(rows[1].key, "k-c");
+    }
+
+    #[test]
+    fn memory_delete_reports_whether_row_existed() {
+        let c = mem();
+        put_blocker(&c, "kode", "k1", "x");
+        assert!(memory_delete(&c, "k1").unwrap());
+        assert!(!memory_delete(&c, "k1").unwrap(), "second delete = no row");
+        assert!(memory_get(&c, "k1").unwrap().is_none());
+    }
+
+    #[test]
+    fn memory_seat_counts_aggregate_per_seat() {
+        let c = mem();
+        put_blocker(&c, "apollo", "k1", "x");
+        memory_put(&c, "k2", Some("apollo"), Some("decision"), "y", None).unwrap();
+        put_blocker(&c, "atlas", "k3", "z");
+        let counts = memory_seat_counts(&c).unwrap();
+        assert_eq!(
+            counts,
+            vec![("apollo".to_string(), 2), ("atlas".to_string(), 1)]
+        );
+    }
 }
 
 /// One presence row (FLEETD-PRESENCE-001): current liveness of a seat as
@@ -658,6 +796,116 @@ pub fn presence_rows(c: &Connection, state_filter: &str) -> Result<Vec<PresenceR
         })
     })?;
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+/// One fleet-memory note (FLEETD-MEM-001, docs/agent-support.md §4.2): a
+/// structured note any writer (hermes / fleetd / a seat) attaches under a
+/// convention key, e.g. `seat:kode:blocker:KODE-WINPKG-001`. This is the
+/// storage + convention face only; retrieval mechanisms come later.
+#[derive(Debug, Clone)]
+pub struct MemoryRow {
+    pub key: String,
+    /// Owning seat (None = fleet-global note).
+    pub seat: Option<String>,
+    /// Free-form tag (blocker / decision / credgap / ...).
+    pub tag: Option<String>,
+    pub content: String,
+    /// Writer identity (hermes / fleetd / seat:<name>).
+    pub source: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+/// Upsert one memory note. UNIQUE(key) conflict updates seat/tag/content/
+/// source/updated_at; created_at keeps the first-write time.
+#[allow(clippy::too_many_arguments)]
+pub fn memory_put(
+    c: &Connection,
+    key: &str,
+    seat: Option<&str>,
+    tag: Option<&str>,
+    content: &str,
+    source: Option<&str>,
+) -> Result<()> {
+    let now = now_secs();
+    c.execute(
+        "INSERT INTO memory(key,seat,tag,content,source,created_at,updated_at)
+         VALUES(?1,?2,?3,?4,?5,?6,?6)
+         ON CONFLICT(key) DO UPDATE SET
+             seat=excluded.seat, tag=excluded.tag, content=excluded.content,
+             source=excluded.source, updated_at=excluded.updated_at",
+        rusqlite::params![key, seat, tag, content, source, now],
+    )?;
+    Ok(())
+}
+
+const MEMORY_COLS: &str = "key,seat,tag,content,source,created_at,updated_at";
+
+fn memory_row(r: &rusqlite::Row) -> rusqlite::Result<MemoryRow> {
+    Ok(MemoryRow {
+        key: r.get(0)?,
+        seat: r.get(1)?,
+        tag: r.get(2)?,
+        content: r.get(3)?,
+        source: r.get(4)?,
+        created_at: r.get(5)?,
+        updated_at: r.get(6)?,
+    })
+}
+
+/// Fetch one note by exact key.
+pub fn memory_get(c: &Connection, key: &str) -> Result<Option<MemoryRow>> {
+    let mut st = c.prepare(&format!("SELECT {MEMORY_COLS} FROM memory WHERE key = ?1"))?;
+    let row = st
+        .query_row(rusqlite::params![key], memory_row)
+        .optional()?;
+    Ok(row)
+}
+
+/// List notes newest-update first. Seat and tag are independent optional
+/// filters (seat filter matches only notes owned by that seat — global
+/// notes with NULL seat are excluded from seat-scoped lists).
+pub fn memory_list(
+    c: &Connection,
+    seat: Option<&str>,
+    tag: Option<&str>,
+    limit: i64,
+) -> Result<Vec<MemoryRow>> {
+    let mut st = c.prepare(&format!(
+        "SELECT {MEMORY_COLS} FROM memory
+         WHERE (?1 IS NULL OR seat = ?1) AND (?2 IS NULL OR tag = ?2)
+         ORDER BY updated_at DESC LIMIT ?3"
+    ))?;
+    let rows = st
+        .query_map(rusqlite::params![seat, tag, limit], memory_row)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Delete one note by key. Returns true when a row was removed.
+pub fn memory_delete(c: &Connection, key: &str) -> Result<bool> {
+    let n = c.execute("DELETE FROM memory WHERE key = ?1", [key])?;
+    Ok(n > 0)
+}
+
+/// Per-seat note counts (for the /v1/fleet face: each seat row carries its
+/// memory count so dashboards read it without a second round-trip).
+pub fn memory_seat_counts(c: &Connection) -> Result<Vec<(String, i64)>> {
+    let mut st = c.prepare(
+        "SELECT seat, COUNT(*) FROM memory
+         WHERE seat IS NOT NULL GROUP BY seat ORDER BY seat",
+    )?;
+    let rows = st
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
 }
 
 /// Dispatches fired but not yet finished — the "is fleetd working" signal

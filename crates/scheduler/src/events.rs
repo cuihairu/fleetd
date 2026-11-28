@@ -91,6 +91,28 @@ impl PeerAddr for std::os::windows::net::UnixStream {
     }
 }
 
+/// Loopback gate shared by the local-only faces (/v1/status, /v1/fleet,
+/// /v1/memory): TCP peers must be loopback; UDS carries no peer address —
+/// the socket file itself is the local boundary, so a successful connect
+/// already proves same-machine.
+fn loopback_peer<S: Read + Write + PeerAddr>(stream: &S) -> bool {
+    PeerAddr::peer_addr(stream)
+        .ok()
+        .flatten()
+        .map(|a| a.ip().is_loopback())
+        .unwrap_or(true)
+}
+
+/// One `?key=value` from the request line's path (None when absent).
+fn query_param(request_line: &str, key: &str) -> Option<String> {
+    let path = request_line.split_whitespace().nth(1)?;
+    let q = path.split_once('?')?.1;
+    q.split('&').find_map(|kv| {
+        let (k, v) = kv.split_once('=')?;
+        (k == key).then(|| v.to_string())
+    })
+}
+
 /// 泛化到 Read+Write:HTTP 解析只做读写,UnixListener/插座面同链路复用
 /// (2026-11-27 UNIX socket 默认面拆分)。
 pub fn handle_stream<S: Read + Write + PeerAddr>(
@@ -187,15 +209,7 @@ pub fn handle_stream<S: Read + Write + PeerAddr>(
         // process memory, so the tray keeps working when serve moves to
         // another process. Non-loopback peers get 403.
         Some("GET") if request_line.contains("/v1/status") => {
-            // Loopback gate: TCP peers must be loopback; UDS has no peer
-            // address — the socket file itself is the local boundary, so a
-            // successful connect already proves same-machine.
-            let peer = PeerAddr::peer_addr(stream)
-                .ok()
-                .flatten()
-                .map(|a| a.ip().is_loopback())
-                .unwrap_or(true);
-            if !peer {
+            if !loopback_peer(stream) {
                 (403, r#"{"error":"loopback only"}"#.to_string())
             } else {
                 let busy = store::ledger::in_flight_count();
@@ -214,35 +228,24 @@ pub fn handle_stream<S: Read + Write + PeerAddr>(
         // gate only (same as /v1/status; no --public face was chartered).
         // `?state=<name>` narrows to one state, e.g. ?state=blocked-style
         // dashboards ask for ?state=idle. `last_commit` = newest lifecycle
-        // event ts for the seat from the ledger.
+        // event ts for the seat from the ledger. `notes` (FLEETD-MEM-001) =
+        // the seat's fleet-memory count, so dashboards read it in one trip.
         Some("GET")
             if request_line.contains("/v1/fleet")
                 && !request_line.contains("/v1/fleet/summary") =>
         {
-            let peer = PeerAddr::peer_addr(stream)
-                .ok()
-                .flatten()
-                .map(|a| a.ip().is_loopback())
-                .unwrap_or(true);
-            if !peer {
+            if !loopback_peer(stream) {
                 (403, r#"{"error":"loopback only"}"#.to_string())
             } else {
-                let state_filter = request_line
-                    .split_whitespace()
-                    .nth(1)
-                    .unwrap_or("")
-                    .split_once('?')
-                    .map(|(_, q)| {
-                        q.split('&')
-                            .find_map(|kv| kv.strip_prefix("state="))
-                            .unwrap_or("")
-                            .to_string()
-                    })
-                    .unwrap_or_default();
-                match store::ledger::open()
-                    .and_then(|c| store::ledger::presence_rows(&c, &state_filter))
-                {
-                    Ok(rows) => {
+                let state_filter = query_param(request_line, "state").unwrap_or_default();
+                let face = store::ledger::open().and_then(|c| {
+                    let rows = store::ledger::presence_rows(&c, &state_filter)?;
+                    let counts: std::collections::HashMap<String, i64> =
+                        store::ledger::memory_seat_counts(&c)?.into_iter().collect();
+                    Ok((rows, counts))
+                });
+                match face {
+                    Ok((rows, counts)) => {
                         let arr: Vec<serde_json::Value> = rows
                             .iter()
                             .map(|r| {
@@ -253,6 +256,83 @@ pub fn handle_stream<S: Read + Write + PeerAddr>(
                                     "blocked": r.blocked,
                                     "last_event_ts": r.last_event_ts,
                                     "last_commit": r.last_commit,
+                                    "notes": counts.get(&r.seat).copied().unwrap_or(0),
+                                })
+                            })
+                            .collect();
+                        match serde_json::to_string(&arr) {
+                            Ok(j) => (200, j),
+                            Err(e) => (500, format!(r#"{{"error":"{}"}}"#, e)),
+                        }
+                    }
+                    Err(e) => (500, format!(r#"{{"error":"{}"}}"#, e)),
+                }
+            }
+        }
+        // Memory face (FLEETD-MEM-001, docs/agent-support.md §4.2): the
+        // convention + storage face for fleet-memory notes. Loopback gate
+        // only (same charter as /v1/fleet). GET lists newest-update first;
+        // PUT upserts by the UNIQUE key.
+        Some("PUT") if request_line.contains("/v1/memory") => {
+            if !loopback_peer(stream) {
+                (403, r#"{"error":"loopback only"}"#.to_string())
+            } else {
+                let parsed = serde_json::from_str::<serde_json::Value>(&body);
+                match parsed {
+                    Ok(v) => {
+                        let key = v.get("key").and_then(|x| x.as_str()).unwrap_or("");
+                        let content = v.get("content").and_then(|x| x.as_str()).unwrap_or("");
+                        let clean =
+                            |f: &str| v.get(f).and_then(|x| x.as_str()).filter(|s| !s.is_empty());
+                        let result = if key.is_empty() || content.is_empty() {
+                            Err(anyhow::anyhow!("key and content required"))
+                        } else {
+                            store::ledger::open().and_then(|c| {
+                                store::ledger::memory_put(
+                                    &c,
+                                    key,
+                                    clean("seat"),
+                                    clean("tag"),
+                                    content,
+                                    clean("source"),
+                                )
+                            })
+                        };
+                        match result {
+                            Ok(_) => (200, r#"{"ok":true}"#.to_string()),
+                            Err(e) => (400, format!(r#"{{"error":"{}"}}"#, e)),
+                        }
+                    }
+                    Err(e) => (400, format!(r#"{{"error":"{}"}}"#, e)),
+                }
+            }
+        }
+        Some("GET") if request_line.contains("/v1/memory") => {
+            if !loopback_peer(stream) {
+                (403, r#"{"error":"loopback only"}"#.to_string())
+            } else {
+                let seat = query_param(request_line, "seat").filter(|s| !s.is_empty());
+                let tag = query_param(request_line, "tag").filter(|s| !s.is_empty());
+                let limit = query_param(request_line, "limit")
+                    .and_then(|v| v.parse::<i64>().ok())
+                    .unwrap_or(20)
+                    .clamp(1, 500);
+                let rows = store::ledger::open().and_then(|c| {
+                    store::ledger::memory_list(&c, seat.as_deref(), tag.as_deref(), limit)
+                });
+                match rows {
+                    Ok(rows) => {
+                        let arr: Vec<serde_json::Value> = rows
+                            .iter()
+                            .map(|r| {
+                                serde_json::json!({
+                                    "key": r.key,
+                                    "seat": r.seat,
+                                    "tag": r.tag,
+                                    "content": r.content,
+                                    "source": r.source,
+                                    "created_at": r.created_at,
+                                    "updated_at": r.updated_at,
                                 })
                             })
                             .collect();

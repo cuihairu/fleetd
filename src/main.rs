@@ -1347,6 +1347,114 @@ fn main() -> Result<()> {
                 }
             }
         }
+        // --- fleet-memory face (FLEETD-MEM-001, docs/agent-support.md §4.2):
+        // the convention + storage surface. Keys are structured
+        // (`seat:<name>:blocked`, `global:<topic>`), content comes from
+        // stdin on put — compose with heredocs, never inline secrets.
+        Some("memory") => {
+            let sub = args
+                .get(2)
+                .context("usage: fleetd memory put|get|list|rm ...")?
+                .as_str()
+                .to_string();
+            // Optional flag lookup (--seat/--tag/--source/-n) anywhere after
+            // the subcommand; empty values count as unset.
+            let flag = |name: &str| -> Option<String> {
+                args.iter()
+                    .position(|a| a == name)
+                    .and_then(|i| args.get(i + 1))
+                    .map(String::clone)
+                    .filter(|v| !v.is_empty())
+            };
+            let open_ledger = || store::ledger::open();
+            match sub.as_str() {
+                "put" => {
+                    let key = args
+                        .get(3)
+                        .context(
+                            "usage: fleetd memory put <key> [--seat S] [--tag T] [--source SRC]",
+                        )?
+                        .clone();
+                    let mut raw = String::new();
+                    std::io::stdin().read_to_string(&mut raw)?;
+                    let content = raw.trim().to_string();
+                    anyhow::ensure!(!content.is_empty(), "memory content required on stdin");
+                    store::ledger::memory_put(
+                        &open_ledger()?,
+                        &key,
+                        flag("--seat").as_deref(),
+                        flag("--tag").as_deref(),
+                        &content,
+                        flag("--source").as_deref(),
+                    )?;
+                    println!("saved {key}");
+                }
+                "get" => {
+                    let key = args
+                        .get(3)
+                        .context("usage: fleetd memory get <key>")?
+                        .clone();
+                    let row = open_ledger()
+                        .and_then(|c| store::ledger::memory_get(&c, &key))?
+                        .with_context(|| format!("no such key: {key}"))?;
+                    let fmt = |t: i64| {
+                        fleetd_core::schedule::ts(t)
+                            .format("%Y-%m-%d %H:%M")
+                            .to_string()
+                    };
+                    println!("key: {}", row.key);
+                    println!(
+                        "seat: {} | tag: {} | source: {}",
+                        row.seat.as_deref().unwrap_or("-"),
+                        row.tag.as_deref().unwrap_or("-"),
+                        row.source.as_deref().unwrap_or("-")
+                    );
+                    println!(
+                        "created: {} | updated: {}",
+                        fmt(row.created_at),
+                        fmt(row.updated_at)
+                    );
+                    println!("{}", row.content);
+                }
+                "list" => {
+                    let n = flag("-n").and_then(|v| v.parse::<i64>().ok()).unwrap_or(20);
+                    let rows = open_ledger().and_then(|c| {
+                        store::ledger::memory_list(
+                            &c,
+                            flag("--seat").as_deref(),
+                            flag("--tag").as_deref(),
+                            n.clamp(1, 500),
+                        )
+                    })?;
+                    for r in rows {
+                        let t = fleetd_core::schedule::ts(r.updated_at)
+                            .format("%m-%d %H:%M")
+                            .to_string();
+                        let first = r.content.lines().next().unwrap_or("");
+                        let short: String = first.chars().take(72).collect();
+                        println!(
+                            "{} | {:<10} | {:<9} | {} :: {}",
+                            t,
+                            r.seat.as_deref().unwrap_or("-"),
+                            r.tag.as_deref().unwrap_or("-"),
+                            r.key,
+                            short
+                        );
+                    }
+                }
+                "rm" => {
+                    let key = args
+                        .get(3)
+                        .context("usage: fleetd memory rm <key>")?
+                        .clone();
+                    let removed =
+                        open_ledger().and_then(|c| store::ledger::memory_delete(&c, &key))?;
+                    anyhow::ensure!(removed, "no such key: {key}");
+                    println!("removed {key}");
+                }
+                _ => anyhow::bail!("usage: fleetd memory put|get|list|rm"),
+            }
+        }
         Some("serve") => {
             // Tray is a SEPARATE process now (`fleetd tray`, 2026-11-27 用户令
             // 「tray 和 serve 拆开」): serve never spawns it; the OS service
