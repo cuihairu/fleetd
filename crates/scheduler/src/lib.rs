@@ -9,5 +9,6 @@ pub mod jobs;
 pub mod presence;
 pub mod pyhost;
 pub mod scheduler;
+pub mod selfupdate;
 // The Windows SCM face moved to the `service` crate with the 2026-11-27
 // split; it is declared there (cfg-gated), not here.

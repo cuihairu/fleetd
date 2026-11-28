@@ -559,6 +559,12 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let args: Vec<String> = std::env::args().collect();
+    // Version face (FLEETD-SELFUPDATE-001): works without any config — the
+    // hash is baked in at build time and IS the version identity.
+    if args.iter().any(|a| a == "--version" || a == "-V" || a == "version") {
+        println!("{}", scheduler::selfupdate::version_string());
+        return Ok(());
+    }
     let cfg_path = args
         .iter()
         .position(|a| a == "--config")
@@ -1687,6 +1693,64 @@ fn main() -> Result<()> {
         // evidence. review list = the checker's queue; pass = land as done
         // (evidence mandatory); fail = bounce back to the seat with a
         // recorded reason (>=2 rejections escalate to the orchestrator).
+        Some("update") => {
+            // Self-update face (FLEETD-SELFUPDATE-001). No hosts config
+            // needed — every path is explicit flags over ssh/scp.
+            let flag = |name: &str| -> Option<String> {
+                args.iter()
+                    .position(|a| a == name)
+                    .and_then(|i| args.get(i + 1))
+                    .cloned()
+                    .filter(|v| !v.is_empty())
+            };
+            let restart = args.iter().any(|a| a == "--restart");
+            let host = flag("--host").unwrap_or_else(|| "local".into());
+            if args.iter().any(|a| a == "--check") {
+                // Read-only: report the gap between this build and origin.
+                match scheduler::selfupdate::check() {
+                    Ok(c) => {
+                        println!(
+                            "build {} | origin/main {} | {}",
+                            c.build_hash,
+                            c.origin_main,
+                            if c.up_to_date {
+                                "up to date".into()
+                            } else {
+                                format!(
+                                    "update available{}",
+                                    c.behind_by
+                                        .map(|b| format!(" ({b})"))
+                                        .unwrap_or_default()
+                                )
+                            }
+                        );
+                    }
+                    Err(e) => {
+                        // No half-updates offline: say why and exit nonzero.
+                        eprintln!("update --check: {e:#}");
+                        anyhow::bail!("check failed; nothing was touched");
+                    }
+                }
+            } else if args.iter().any(|a| a == "--rollback") {
+                scheduler::selfupdate::rollback(&host, restart)?;
+                println!("rollback on {host} done (binary restored from .bak)");
+            } else {
+                // The live-work guard covers every path that bounces a face.
+                scheduler::selfupdate::guard_live_work(restart)?;
+                let from_to = match host.as_str() {
+                    "local" => scheduler::selfupdate::update_local(restart)?,
+                    "imac" => scheduler::selfupdate::update_remote_windows(&host, restart)?,
+                    _ => scheduler::selfupdate::update_remote_linux(&host, restart)?,
+                };
+                println!(
+                    "update on {host}: {} -> {}{}",
+                    from_to.0,
+                    from_to.1,
+                    if restart { " (restarted)" } else { "" }
+                );
+                println!("before: {}", scheduler::selfupdate::version_string());
+            }
+        }
         Some("infra-check") => {
             // One infra-watch round (FLEETD-SERVE-001): probe the registered
             // machine list, record state changes as infra_down/infra_up

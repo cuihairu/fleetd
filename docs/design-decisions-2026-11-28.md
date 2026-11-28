@@ -201,3 +201,24 @@ SshMachine work-runner 双机各 1 槽，j1 本地、j2 满载改道远端、j3/
 kill -9 → ~3s 复活；imac 停服→infra_down→修复→infra_up 全链落 events 表；cargo test 全绿
 （scheduler 30 含 infra 3 测试：sc query 解析/翻转去重/注册机清单）。
 **教训**：`pgrep -x tmux` 在 Linux 永远不中——tmux server 进程 comm 是 `tmux: server`。
+
+## D10. fleet 自我更新（2026-11-28 派单 FLEETD-SELFUPDATE-001）✅
+
+用户令「fleet 怎么自我更新」。版本标识=git 短 hash（build.rs 钉进二进制，
+`fleetd --version` = `0.2.0+g<hash>`），update 流程全部以 hash 对账：
+- **`fleetd update --check`**：git ls-remote origin/main 对比 build hash，只读；网络失败明确
+  报错不半升级（附带 behind 统计）。
+- **本机**（systemd 单元直指 target/release）：cp fleetd→fleetd.bak → `git pull --ff-only` →
+  `cargo build --release` → `--restart` 时 `systemctl --user restart fleetd`。
+- **远程 linux**（work-runner 跑法=`~/.fleetd/fleetd serve --port 3790` 裸常驻）：scp 到
+  `.fleetd/fleetd.new` → 远端一条命令 cp .bak+原子 rename+`--version` 核对；`--restart`
+  时 pkill+setsid nohup 重拉（ssh 会话不得持有进程）。
+- **windows**（imac）：scp 到 `fleetd.new.exe` → PowerShell 单脚本 Stop-Service→备份→换→
+  Start-Service（停窗=脚本自身秒级）；tray exe 存在才顺带换（TRAY-001 部署待编排方，
+  absent 时跳过不报错）。
+- **安全闸**：活面 guard——/v1/machines 跑动负载 running+queued>0 且无 `--restart` 就拒绝
+  弹面；每个被换二进制留恰好一份 `.bak`；`update --rollback [--host]` 用 .bak 还原。
+- **记账**：update_applied（from→to）/update_rollback 落 events 表。
+- **host 形态分流**：`update [--host local|work-runner|imac]`，清单复用 infra-watch 三机
+  常量；fleet.toml `[update]` 配置段未落（内置清单够用，如实登记不写假配置——对账令）。
+- 凭据走本机 ssh config（VAULT-001 交付后接 cred_ref，spec 原文如此安排）。
