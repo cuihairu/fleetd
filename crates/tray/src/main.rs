@@ -1,15 +1,17 @@
 //! fleetd-tray: standalone windows tray indicator binary.
 //!
-//! 独立二进制(2026-11-27 拆分):零 python 依赖、无 DLL 闭包负担,部署只拷
-//! 一个小 exe。主线程 spawn 后阻塞等待窗口线程结束(主线程 return = 进程
-//! 退出 = tray 秒退,2026-11-27 cuihaitao 真机实证)。
+//! Standalone binary (split off 2026-11-27): zero python dependency, no DLL
+//! closure baggage, deployment is copying one small exe. The main thread
+//! blocks forever while the window thread lives (a returning main = process
+//! exit = instant tray death, seen live on cuihaitao 2026-11-27).
 
 #[cfg(target_os = "windows")]
 fn main() {
-    let _spawn = tray_lib::spawn;
-    // spawn then block forever inside the library face
-    tray_lib::spawn();
-    tray_lib::wait_forever();
+    // Bind the StopHandle for the whole process lifetime: dropping it asks
+    // the tray to remove its icon and quit (StopHandle::drop), so a plain
+    // `tray_lib::spawn();` would kill the tray the instant main moves on.
+    let _stop = fleetd_tray_lib::spawn();
+    fleetd_tray_lib::wait_forever();
 }
 
 #[cfg(not(target_os = "windows"))]

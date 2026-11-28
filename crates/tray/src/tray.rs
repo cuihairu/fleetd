@@ -66,9 +66,9 @@ static G_NID: AtomicIsize = AtomicIsize::new(0);
 static G_EXIT: AtomicBool = AtomicBool::new(false);
 
 // --- Right-click menu (2026-11-27 用户令「右键能看状态」) -------------------
-// Status line lives in a global set by the serve thread (UTF-16 ready);
-// menu ids are small consts so WM_COMMAND can act on them.
-const MENU_STATUS: usize = 100;
+// Status line lives in a global set by the serve thread (UTF-16 ready); the
+// status row is disabled with id 0 (never matched in WM_COMMAND), menu ids
+// are small consts so WM_COMMAND can act on them.
 const MENU_OPEN_PANEL: usize = 101;
 const MENU_QUIT: usize = 102;
 
@@ -119,10 +119,6 @@ fn open_panel() {
         .spawn();
 }
 
-fn flagship_base() -> String {
-    std::env::var("FLEETD_STATUS_URL").unwrap_or_else(|_| "http://127.0.0.1:3790/v1/status".into())
-}
-
 /// GET /v1/status → in_flight count; any failure = 0 (idle).
 fn fetch_in_flight() -> i64 {
     fetch_status_field("in_flight")
@@ -152,23 +148,18 @@ fn url_port(url: &str) -> Option<String> {
 }
 
 /// One-line loopback GET returning a JSON numeric/string field.
-/// Tray↔flagship 本机通信(2026-11-27 钦定):UNIX socket(Windows 10 1803+
-/// 原生 AF_UNIX,std 同 API),不走 loopback TCP。路径与 flagship serve 一致:
-/// %USERPROFILE%\.fleetd\flagship.sock。覆盖 FLEETD_STATUS_URL 仅在测试用。
+/// Tray↔flagship transport (2026-11-28 dispatch): plain loopback TCP HTTP to
+/// the flagship serve face (default 127.0.0.1:3790, same endpoint as
+/// serve_on). No Unix sockets here — the tray is a Windows face and must
+/// build and run without any AF_UNIX dependency. FLEETD_STATUS_URL overrides
+/// the endpoint (tests only).
 fn fetch_status_field(field: &str) -> Option<String> {
     use std::io::{Read as _, Write as _};
 
-    let path = std::env::var("FLEETD_STATUS_SOCK").unwrap_or_else(|_| {
-        let home = std::env::var("USERPROFILE")
-            .or_else(|_| std::env::var("HOME"))
-            .unwrap_or_else(|_| ".".into());
-        format!("{home}\\.fleetd\\flagship.sock")
-    });
-    let mut stream = uds::UnixStream::connect(path).ok()?;
-    let _ = stream.write_all(
-        format!("GET /v1/status HTTP/1.1\r\nHost: flagship\r\nConnection: close\r\n\r\n")
-            .as_bytes(),
-    );
+    let (host, port) = status_endpoint()?;
+    let mut stream = std::net::TcpStream::connect((host.as_str(), port)).ok()?;
+    let _ =
+        stream.write_all(b"GET /v1/status HTTP/1.1\r\nHost: flagship\r\nConnection: close\r\n\r\n");
     let mut body = Vec::new();
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
     let _ = stream.read_to_end(&mut body);
@@ -178,13 +169,24 @@ fn fetch_status_field(field: &str) -> Option<String> {
     let pat = format!("\"{}\"", field);
     let start = json.find(&pat)? + pat.len();
     let rest = &json[start..];
-    let rest = rest.trim_start_matches(|c| c == ':' || c == ' ');
+    let rest = rest.trim_start_matches([':', ' ']);
     let end = rest.find([',', '}']).unwrap_or(rest.len());
     let value = rest[..end].trim_matches('"').to_string();
     if value.is_empty() {
         None
     } else {
         Some(value)
+    }
+}
+
+/// Split the status endpoint (FLEETD_STATUS_URL or the 127.0.0.1:3790
+/// default) into a connectable host + port pair. None = malformed override.
+fn status_endpoint() -> Option<(String, u16)> {
+    let url = std::env::var("FLEETD_STATUS_URL").unwrap_or_else(|_| "http://127.0.0.1:3790".into());
+    let authority = url.split("://").nth(1).unwrap_or(&url).split('/').next()?;
+    match authority.rsplit_once(':') {
+        Some((host, port)) => Some((host.to_string(), port.parse().ok()?)),
+        None => Some((authority.to_string(), 3790)),
     }
 }
 
@@ -215,7 +217,9 @@ fn rgba_to_icon(rgba: &[u8]) -> HICON {
             biCompression: BI_RGB,
             ..std::mem::zeroed()
         };
-        let mut bits: *mut fleetd_core::ffi::c_void = std::ptr::null_mut();
+        // Raw pointer type matches the windows-sys CreateDIBSection signature;
+        // tray stays free of any fleetd-internal crate dependency.
+        let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
         let dib = CreateDIBSection(
             std::ptr::null_mut(),
             &bmi,
@@ -266,11 +270,11 @@ unsafe extern "system" fn tray_wnd_proc(
                     }
                 }
             }
-            // Pull status over the loopback face (2026-11-27 用户令「tray 尽量
-            // 用 UNIX socket 通信」): tray ↔ serve talk over the local status
-            // endpoint instead of shared process memory, so the tray survives
-            // serve moving to another process. Any failure reads as idle —
-            // the tray must never die because the flagship hiccuped.
+            // Pull status over the loopback HTTP face: tray ↔ serve talk over
+            // the local status endpoint instead of shared process memory, so
+            // the tray survives serve moving to another process. Any failure
+            // reads as idle — the tray must never die because the flagship
+            // hiccuped.
             let busy = fetch_in_flight();
             if let Some(line) = fetch_status_line() {
                 if let Ok(mut slot) = G_STATUS.lock() {
