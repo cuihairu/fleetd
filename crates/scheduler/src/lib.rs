@@ -1,6 +1,7 @@
 //! fleetd-scheduler: events HTTP face, scheduler, headless runs, MCP, pyhost, SCM.
 //! 服务器面层——依赖 fleetd-core 的账本/派单原语。
 
+pub mod attach;
 pub mod events;
 pub mod headless;
 pub mod jobs;

@@ -4,6 +4,7 @@
 //! `report`, service lifecycle in `service`, server IO in `scheduler`.
 
 pub mod agent;
+pub mod attach;
 pub mod config;
 pub mod dispatcher;
 pub mod presence;

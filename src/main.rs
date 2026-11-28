@@ -1295,6 +1295,58 @@ fn main() -> Result<()> {
             let verdict = events::ingest(&body)?;
             println!("{seat} -> {verdict}");
         }
+        // --- attach face (FLEETD-ATTACH-001): access orchestration only —
+        // never proxy raw terminal streams (docs/agent-support.md §4.1).
+        Some("attach") => {
+            // fleetd attach <seat|run-id>
+            // fleetd attach --snapshot <seat>
+            // fleetd attach --tail <seat> [-n LINES]
+            match args.get(2).map(String::as_str) {
+                Some("--snapshot") => {
+                    let seat = args
+                        .get(3)
+                        .context("usage: fleetd attach --snapshot <seat>")?;
+                    let text = scheduler::attach::snapshot(seat)
+                        .with_context(|| format!("seat {seat}: no live tmux session"))?;
+                    print!("{text}");
+                }
+                Some("--tail") => {
+                    let seat = args
+                        .get(3)
+                        .context("usage: fleetd attach --tail <seat> [-n LINES]")?;
+                    let n = args
+                        .iter()
+                        .position(|a| a == "-n")
+                        .and_then(|i| args.get(i + 1))
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(50);
+                    let text = scheduler::attach::tail_transcript(seat, n).with_context(|| {
+                        format!("seat {seat}: no transcript (never ran in this workspace)")
+                    })?;
+                    println!("{text}");
+                }
+                Some(target) => match scheduler::attach::route(target) {
+                    scheduler::attach::Route::Interactive { session } => {
+                        // A live seat session: the human attaches with their
+                        // own real terminal — fleetd only prints the command.
+                        println!("{}", scheduler::attach::attach_command(&session));
+                    }
+                    scheduler::attach::Route::Headless { run_id } => {
+                        let text = scheduler::attach::run_stream(&run_id)
+                            .with_context(|| format!("run {run_id}: no readable stream"))?;
+                        println!("{text}");
+                    }
+                    scheduler::attach::Route::Nothing => {
+                        anyhow::bail!("seat {target}: no live session and no headless runs");
+                    }
+                },
+                None => {
+                    anyhow::bail!(
+                        "usage: fleetd attach <seat|run-id> | attach --snapshot <seat> | attach --tail <seat> [-n LINES]"
+                    );
+                }
+            }
+        }
         Some("serve") => {
             // Tray is a SEPARATE process now (`fleetd tray`, 2026-11-27 用户令
             // 「tray 和 serve 拆开」): serve never spawns it; the OS service
