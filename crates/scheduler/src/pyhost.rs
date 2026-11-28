@@ -206,66 +206,76 @@ fn configure_bundled_runtime() {
     std::env::set_var("PYTHONPATH", runtime.join("Lib"));
 }
 
+/// Test-only serialization for the embedded interpreter. It is process-global
+/// (one CPython per test binary) and every pyhost-facing test shares three
+/// pieces of mutable global state: the API OnceLock, the sys.modules
+/// registration, and run_source's sys.stdout swap. Run concurrently they
+/// race — observed at HEAD 2026-11-28 as 3/5 red suite runs ("No module
+/// named 'fleetd'" / empty seats). Every interpreter-touching test holds
+/// this lock.
+#[cfg(test)]
+pub(crate) static PY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Process-wide log counter behind the shared test fixture. init() is a
+/// process-global OnceLock — whichever test registers first routes every
+/// pymodule call for the whole binary, so per-test private stubs are
+/// inherently racy (observed at HEAD 2026-11-28: 3/5 red suite runs,
+/// "No module named 'fleetd'" / empty seats / hooks not counted, by
+/// start-order luck). All interpreter tests therefore register the SAME
+/// fixture via test_init() and assert against shared state.
+#[cfg(test)]
+static TEST_LOGS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+struct SharedTestApi;
+
+#[cfg(test)]
+impl FleetdApi for SharedTestApi {
+    fn log(&self, _m: &str) {
+        TEST_LOGS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    fn alert(&self, _m: &str) {}
+    fn seats(&self) -> Vec<(String, String)> {
+        vec![("coding".into(), "ok".into())]
+    }
+    fn jobs(&self) -> Vec<(String, String, bool)> {
+        vec![("guard".into(), "*/30".into(), true)]
+    }
+    fn run_job(&self, name: &str) -> Result<i32> {
+        Ok(if name == "guard" { 0 } else { 1 })
+    }
+}
+
+/// Idempotent registration of the shared fixture (later init calls are
+/// OnceLock no-ops, and they are harmless because the fixture is the same
+/// object every test expects).
+#[cfg(test)]
+pub(crate) fn test_init() {
+    init(Box::new(SharedTestApi)).unwrap();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    struct StubApi {
-        logs: AtomicUsize,
-    }
-    impl FleetdApi for StubApi {
-        fn log(&self, _m: &str) {
-            self.logs.fetch_add(1, Ordering::SeqCst);
-        }
-        fn alert(&self, _m: &str) {}
-        fn seats(&self) -> Vec<(String, String)> {
-            vec![("coding".into(), "ok".into())]
-        }
-        fn jobs(&self) -> Vec<(String, String, bool)> {
-            vec![("guard".into(), "*/30".into(), true)]
-        }
-        fn run_job(&self, name: &str) -> Result<i32> {
-            Ok(if name == "guard" { 0 } else { 1 })
-        }
-    }
+    use std::sync::atomic::Ordering;
 
     #[test]
     fn python_runs_and_hooks_fire() {
-        let logs = std::sync::Arc::new(AtomicUsize::new(0));
-        // Wrap: the trait object needs 'static ownership; use a shared counter.
-        struct Shared(std::sync::Arc<AtomicUsize>);
-        impl FleetdApi for Shared {
-            fn log(&self, _m: &str) {
-                self.0.fetch_add(1, Ordering::SeqCst);
-            }
-            fn alert(&self, _m: &str) {}
-            fn seats(&self) -> Vec<(String, String)> {
-                vec![("coding".into(), "ok".into())]
-            }
-            fn jobs(&self) -> Vec<(String, String, bool)> {
-                vec![("guard".into(), "*/30".into(), true)]
-            }
-            fn run_job(&self, name: &str) -> Result<i32> {
-                Ok(if name == "guard" { 0 } else { 1 })
-            }
-        }
-        init(Box::new(Shared(logs.clone()))).unwrap();
+        let _g = PY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        test_init();
+        let before = TEST_LOGS.load(Ordering::SeqCst);
         let out = run_source("import fleetd\nfleetd.log('hi')\nprint('py-ok')").unwrap();
         assert_eq!(out.trim(), "py-ok");
         assert!(
-            logs.load(Ordering::SeqCst) >= 1,
+            TEST_LOGS.load(Ordering::SeqCst) > before,
             "hook must cross the FFI boundary"
         );
     }
 
     #[test]
     fn seat_list_round_trips() {
-        use std::sync::atomic::AtomicUsize;
-        init(Box::new(StubApi {
-            logs: AtomicUsize::new(0),
-        }))
-        .unwrap();
+        let _g = PY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        test_init();
         let out = run_source("import fleetd\nprint(fleetd.seats())").unwrap();
         assert!(out.contains("coding"), "seats visible from python: {out}");
     }

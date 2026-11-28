@@ -37,8 +37,33 @@ pub fn open() -> Result<Connection> {
         std::fs::create_dir_all(dir).with_context(|| format!("create db dir {}", dir.display()))?;
     }
     let c = Connection::open(&path).with_context(|| format!("open ledger {}", path.display()))?;
-    c.execute_batch(
-        "PRAGMA journal_mode=WAL;
+    // busy_timeout (FLEETD-DBMETA-001): the first open after a schema bump
+    // races the running serve (tray + CLI + serve all open the ledger);
+    // waiting on the lock beats failing half-way through a migration.
+    c.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")?;
+    migrate(&c).with_context(|| format!("migrate ledger {}", path.display()))?;
+    Ok(c)
+}
+
+// --- schema versioning: meta table + upgrade-only migrations (FLEETD-DBMETA-001) ---
+//
+// The database records its schema version in a `meta` key/value table (not
+// PRAGMA user_version — a table carries the migration history alongside the
+// version number). Upgrades run forward only: an old binary opening a newer
+// database refuses to start instead of silently tripping over missing
+// columns. `SCHEMA_VERSION` bumps by one with every schema change and a
+// matching Migration entry is appended below — history is never rewritten.
+
+pub const META_SCHEMA_VERSION: &str = "schema_version";
+pub const META_SCHEMA_HISTORY: &str = "schema_history";
+
+/// Latest schema version this binary knows how to write and read.
+pub const SCHEMA_VERSION: i64 = 4;
+
+/// Baseline tables (schema v1). CREATE IF NOT EXISTS everywhere: v1 runs
+/// over both fresh databases and pre-versioning legacy databases, where the
+/// tables already exist and every statement is a no-op.
+const BASELINE_SCHEMA: &str = "
          CREATE TABLE IF NOT EXISTS tasks (
             id TEXT PRIMARY KEY,
             host TEXT NOT NULL,
@@ -122,28 +147,68 @@ pub fn open() -> Result<Connection> {
             UNIQUE(key)
          );
          CREATE INDEX IF NOT EXISTS idx_memory_seat ON memory(seat);
-         CREATE INDEX IF NOT EXISTS idx_memory_tag ON memory(tag);",
-    )?;
-    // Seat-control gate migration (2026-11-26 falcon incident): disabled
-    // seats must be skipped by every auto-start path. ALTER with tolerance
-    // for already-migrated databases.
-    // executor (FLEETD-EXECUTOR-001): seat environment dimension — every
-    // pre-existing seat is tmux, hence the NOT NULL DEFAULT 'tmux'.
+         CREATE INDEX IF NOT EXISTS idx_memory_tag ON memory(tag);";
+
+/// One schema migration step. `up` runs inside a single transaction together
+/// with the version stamp and the history append, so a failed step leaves
+/// the database — and its version number — exactly as before (SQLite DDL is
+/// transactional).
+pub struct Migration {
+    pub version: i64,
+    pub description: &'static str,
+    pub up: fn(&Connection) -> Result<()>,
+}
+
+/// Append one column to a table only when it is missing. Legacy databases
+/// (pre-meta, this machine's ledger.db included) already carry columns the
+/// old try-ALTER era applied: replaying blind ALTERs over them dies on
+/// "duplicate column name", so every column migration is presence-guarded.
+/// Fresh databases take the ALTER path; the version stamp keeps it to one
+/// run either way.
+fn add_column_if_missing(c: &Connection, table: &str, col_ddl: &str) -> Result<()> {
+    let name = col_ddl
+        .split_whitespace()
+        .next()
+        .context("add_column_if_missing: empty column definition")?;
+    let cols: Vec<String> = c
+        .prepare(&format!("PRAGMA table_info({table})"))?
+        .query_map([], |r| r.get(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if cols.iter().any(|col| col == name) {
+        return Ok(());
+    }
+    c.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {col_ddl};"))?;
+    Ok(())
+}
+
+/// v1: the baseline table set.
+fn m1_baseline(c: &Connection) -> Result<()> {
+    c.execute_batch(BASELINE_SCHEMA)?;
+    Ok(())
+}
+
+/// v2: seats gains the seat-control gate (disabled seats are skipped by
+/// every auto-start path; 2026-11-26 falcon incident) and the executor
+/// dimension (FLEETD-EXECUTOR-001) — every pre-existing seat is tmux, hence
+/// the NOT NULL DEFAULT 'tmux'.
+fn m2_seat_gate(c: &Connection) -> Result<()> {
     for col in [
         "stopped_by TEXT",
         "stopped_at INTEGER",
         "executor TEXT NOT NULL DEFAULT 'tmux'",
     ] {
-        let sql = format!("ALTER TABLE seats ADD COLUMN {col};");
-        let _ = c.execute_batch(&sql); // duplicate-column errors are fine
+        add_column_if_missing(c, "seats", col)?;
     }
-    // Adversarial review gate (FLEETD-GATE-001, 2026-11-28): dispatches gain
-    // a first-class state machine. `state`: active (in flight) → review
-    // (awaiting adversarial check) → done (passed with evidence); review_failed
-    // marks a dispatch the checker rejected and re-opened. Legacy columns keep
-    // their meaning; `acceptance` records the task's verification tier,
-    // `evidence_path` the reviewer's receipt, `review_note` the rejection
-    // reason, `reject_count` how many times the checker bounced it.
+    Ok(())
+}
+
+/// v3: dispatches gains the adversarial review gate state machine
+/// (FLEETD-GATE-001, 2026-11-28): `state` active → review → done,
+/// `acceptance` the task's verification tier, `evidence_path` the reviewer's
+/// receipt, `review_note` the rejection reason, `reject_count` the bounce
+/// tally. Legacy rows: everything already finished is done (the gate only
+/// applies to completions reported after this migration).
+fn m3_dispatch_gate(c: &Connection) -> Result<()> {
     for col in [
         "state TEXT NOT NULL DEFAULT 'active'",
         "acceptance TEXT",
@@ -151,23 +216,182 @@ pub fn open() -> Result<Connection> {
         "review_note TEXT",
         "reject_count INTEGER NOT NULL DEFAULT 0",
     ] {
-        let sql = format!("ALTER TABLE dispatches ADD COLUMN {col};");
-        let _ = c.execute_batch(&sql); // duplicate-column errors are fine
+        add_column_if_missing(c, "dispatches", col)?;
     }
-    // Rejection reasons and gate notifications ride on events; `note` carries
-    // the free-form payload (reason / dispatch reference / mode marker).
-    let _ = c.execute_batch("ALTER TABLE events ADD COLUMN note TEXT;");
-    // Backfill legacy rows: everything already finished is done (the gate
-    // only applies to completions reported after this migration).
-    let _ = c.execute_batch(
+    c.execute_batch(
         "UPDATE dispatches SET state='done'
          WHERE finished_at IS NOT NULL AND finished_at != '' AND state='active';",
-    );
-    Ok(c)
+    )?;
+    Ok(())
 }
 
-fn default_kind() -> String {
-    "stop".into()
+/// v4: events gains `note` — rejection reasons and gate notifications ride
+/// the same event chain the Stop hooks write (free-form payload).
+fn m4_event_note(c: &Connection) -> Result<()> {
+    add_column_if_missing(c, "events", "note TEXT")
+}
+
+/// The ordered migration list. New schema changes append entries with
+/// version = previous + 1; existing entries are frozen history.
+static MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        description: "baseline tables (tasks/seats/jobs/job_runs/events/dispatches/presence/memory)",
+        up: m1_baseline,
+    },
+    Migration {
+        version: 2,
+        description: "seats: seat-control gate (stopped_by/stopped_at) + executor dimension",
+        up: m2_seat_gate,
+    },
+    Migration {
+        version: 3,
+        description: "dispatches: adversarial review gate (state/acceptance/evidence_path/review_note/reject_count) + legacy backfill",
+        up: m3_dispatch_gate,
+    },
+    Migration {
+        version: 4,
+        description: "events: note column for gate notifications",
+        up: m4_event_note,
+    },
+];
+
+fn ensure_meta_table(c: &Connection) -> Result<()> {
+    c.execute_batch(
+        "CREATE TABLE IF NOT EXISTS meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );",
+    )?;
+    Ok(())
+}
+
+/// True when the meta table exists (a database predating the versioning
+/// framework has no meta table at all).
+fn has_meta_table(c: &Connection) -> Result<bool> {
+    Ok(c.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'",
+        [],
+        |_| Ok(true),
+    )
+    .optional()?
+    .unwrap_or(false))
+}
+
+/// Read one meta value.
+pub fn get_meta(c: &Connection, key: &str) -> Result<Option<String>> {
+    let mut st = c.prepare("SELECT value FROM meta WHERE key = ?1")?;
+    Ok(st
+        .query_row(rusqlite::params![key], |r| r.get(0))
+        .optional()?)
+}
+
+/// Write one meta value (upsert).
+pub fn set_meta(c: &Connection, key: &str, value: &str) -> Result<()> {
+    c.execute(
+        "INSERT INTO meta(key, value) VALUES(?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        rusqlite::params![key, value],
+    )?;
+    Ok(())
+}
+
+/// The database's current schema version. A database without the meta table
+/// reads as 0 (legacy, pre-versioning); a meta row that fails to parse also
+/// reads as 0 so the migration list replays from the top (column migrations
+/// are presence-guarded, so replaying them over an already-migrated database
+/// is harmless).
+pub fn schema_version(c: &Connection) -> Result<i64> {
+    if !has_meta_table(c)? {
+        return Ok(0);
+    }
+    Ok(get_meta(c, META_SCHEMA_VERSION)?
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0))
+}
+
+/// One applied migration as recorded in the `schema_history` meta value.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct MigrationRecord {
+    pub version: i64,
+    pub description: String,
+    pub applied_at: i64,
+}
+
+/// The database's migration history (empty for legacy databases).
+pub fn schema_history(c: &Connection) -> Result<Vec<MigrationRecord>> {
+    let Some(raw) = get_meta(c, META_SCHEMA_HISTORY)? else {
+        return Ok(Vec::new());
+    };
+    serde_json::from_str(&raw).context("schema_history meta value is not valid JSON")
+}
+
+fn append_history(c: &Connection, version: i64, description: &str, applied_at: i64) -> Result<()> {
+    let mut history = schema_history(c)?;
+    history.push(MigrationRecord {
+        version,
+        description: description.to_string(),
+        applied_at,
+    });
+    set_meta(c, META_SCHEMA_HISTORY, &serde_json::to_string(&history)?)?;
+    Ok(())
+}
+
+/// The upgrade loop, generic over the migration list so tests can drive
+/// failure/rollback scenarios with synthetic migrations. Each migration runs
+/// in one transaction with its version stamp and history append; a failure
+/// anywhere rolls the database back to the previous version. A database
+/// newer than SCHEMA_VERSION is refused outright — downgrading is not
+/// supported (old binaries must not read schemas they don't know).
+fn run_migrations(c: &Connection, migrations: &[Migration]) -> Result<()> {
+    ensure_meta_table(c)?;
+    let current = schema_version(c)?;
+    anyhow::ensure!(
+        current <= SCHEMA_VERSION,
+        "database schema version {current} is newer than this fleetd supports ({SCHEMA_VERSION}); \
+         downgrade not supported — update fleetd instead of rolling the binary back"
+    );
+    for m in migrations.iter().filter(|m| m.version > current) {
+        let tx = c.unchecked_transaction()?;
+        (m.up)(&tx).with_context(|| {
+            format!(
+                "migration v{} ({}) failed; database left at v{current}",
+                m.version, m.description
+            )
+        })?;
+        set_meta(&tx, META_SCHEMA_VERSION, &m.version.to_string())?;
+        append_history(&tx, m.version, m.description, now_secs())?;
+        tx.commit()?;
+    }
+    Ok(())
+}
+
+/// Bring the database up to SCHEMA_VERSION (upgrade only, never down).
+pub fn migrate(c: &Connection) -> Result<()> {
+    run_migrations(c, MIGRATIONS)
+}
+
+/// Read-only schema report for `fleetd db info`. Deliberately no migrate:
+/// the point of this face is reporting exactly the state open() would
+/// refuse — legacy and too-new databases included.
+pub struct DbSchemaInfo {
+    pub db_version: i64,
+    pub has_meta: bool,
+    pub history: Vec<MigrationRecord>,
+}
+
+pub fn db_schema_info(c: &Connection) -> Result<DbSchemaInfo> {
+    let has_meta = has_meta_table(c)?;
+    let history = if has_meta {
+        schema_history(c)?
+    } else {
+        Vec::new()
+    };
+    Ok(DbSchemaInfo {
+        db_version: schema_version(c)?,
+        has_meta,
+        history,
+    })
 }
 
 /// Verdict of an event against the seat's in-flight dispatch baseline.
@@ -1647,4 +1871,248 @@ pub fn in_flight_count() -> i64 {
         |r| r.get::<_, i64>(0),
     )
     .unwrap_or(0)
+}
+
+// --- schema versioning tests (FLEETD-DBMETA-001) ---
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+
+    fn table_exists(c: &Connection, name: &str) -> bool {
+        c.query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+            rusqlite::params![name],
+            |_| Ok(true),
+        )
+        .optional()
+        .unwrap()
+        .unwrap_or(false)
+    }
+
+    fn has_col(c: &Connection, table: &str, col: &str) -> bool {
+        c.prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .collect::<std::result::Result<Vec<String>, _>>()
+            .unwrap()
+            .iter()
+            .any(|x| x == col)
+    }
+
+    fn stamped_version(c: &Connection) -> i64 {
+        get_meta(c, META_SCHEMA_VERSION)
+            .unwrap()
+            .expect("schema_version meta row must exist after migrate")
+            .parse()
+            .unwrap()
+    }
+
+    #[test]
+    fn fresh_db_reaches_latest_version() {
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        assert_eq!(stamped_version(&c), SCHEMA_VERSION);
+        for table in [
+            "meta",
+            "tasks",
+            "seats",
+            "jobs",
+            "job_runs",
+            "events",
+            "dispatches",
+            "presence",
+            "memory",
+        ] {
+            assert!(table_exists(&c, table), "table {table} must exist");
+        }
+        // Latest-version schema carries every dimension the faces read.
+        assert!(has_col(&c, "seats", "executor"));
+        assert!(has_col(&c, "dispatches", "state"));
+        assert!(has_col(&c, "dispatches", "reject_count"));
+        assert!(has_col(&c, "events", "note"));
+    }
+
+    #[test]
+    fn legacy_metaless_db_migrates_without_duplicate_column_errors() {
+        // Pre-versioning database shape: all current tables/columns (the old
+        // try-ALTER era already applied them) but no meta table. Blind ALTERs
+        // would die on "duplicate column name" — the presence guards are what
+        // make replaying v2..v4 safe here.
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(
+            "CREATE TABLE seats (seat TEXT PRIMARY KEY, cwd TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'idle', current_tag TEXT,
+                baseline_head TEXT, updated_at INTEGER NOT NULL,
+                stopped_by TEXT, stopped_at INTEGER,
+                executor TEXT NOT NULL DEFAULT 'tmux');
+             CREATE TABLE dispatches (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                seat TEXT NOT NULL, tag TEXT NOT NULL, fired_at INTEGER NOT NULL,
+                baseline_head TEXT, finished_at INTEGER, outcome TEXT,
+                head_at_finish TEXT, open_at_finish INTEGER, dirty_at_finish INTEGER,
+                note TEXT, state TEXT NOT NULL DEFAULT 'active', acceptance TEXT,
+                evidence_path TEXT, review_note TEXT,
+                reject_count INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts INTEGER NOT NULL, seat TEXT NOT NULL, head TEXT,
+                open_count INTEGER, dirty_count INTEGER, kind TEXT, verdict TEXT,
+                note TEXT);
+             INSERT INTO dispatches (seat, tag, fired_at, finished_at, state)
+                VALUES ('kode', 'old-task', 1, 2, 'active');",
+        )
+        .unwrap();
+        migrate(&c).unwrap();
+        assert_eq!(stamped_version(&c), SCHEMA_VERSION);
+        // No column got duplicated and the legacy row survived untouched.
+        let (n, state): (i64, String) = c
+            .query_row("SELECT COUNT(*), MAX(state) FROM dispatches", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(n, 1);
+        // Backfill marks the finished legacy row done (old try-ALTER behavior).
+        assert_eq!(state, "done");
+    }
+
+    #[test]
+    fn legacy_baseline_db_gains_missing_columns_and_backfills() {
+        // Oldest legacy shape: baseline tables only, no gate columns at all.
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(
+            "CREATE TABLE dispatches (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                seat TEXT NOT NULL, tag TEXT NOT NULL, fired_at INTEGER NOT NULL,
+                baseline_head TEXT, finished_at INTEGER, outcome TEXT,
+                head_at_finish TEXT, open_at_finish INTEGER, dirty_at_finish INTEGER,
+                note TEXT);
+             CREATE TABLE seats (seat TEXT PRIMARY KEY, cwd TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'idle', current_tag TEXT,
+                baseline_head TEXT, updated_at INTEGER NOT NULL);
+             CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts INTEGER NOT NULL, seat TEXT NOT NULL, head TEXT,
+                open_count INTEGER, dirty_count INTEGER, kind TEXT, verdict TEXT);
+             INSERT INTO dispatches (seat, tag, fired_at, finished_at)
+                VALUES ('a', 'done-old', 1, 2);
+             INSERT INTO dispatches (seat, tag, fired_at) VALUES ('b', 'open-old', 3);",
+        )
+        .unwrap();
+        migrate(&c).unwrap();
+        assert_eq!(stamped_version(&c), SCHEMA_VERSION);
+        for col in ["stopped_by", "stopped_at", "executor"] {
+            assert!(has_col(&c, "seats", col), "seats.{col} must be added");
+        }
+        for col in [
+            "state",
+            "acceptance",
+            "evidence_path",
+            "review_note",
+            "reject_count",
+        ] {
+            assert!(
+                has_col(&c, "dispatches", col),
+                "dispatches.{col} must be added"
+            );
+        }
+        assert!(has_col(&c, "events", "note"));
+        // Backfill: the finished legacy row reads done; the in-flight one
+        // keeps the active default.
+        let states: Vec<String> = c
+            .prepare("SELECT state FROM dispatches ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(states, vec!["done".to_string(), "active".to_string()]);
+    }
+
+    #[test]
+    fn failed_migration_rolls_back_version_and_ddl() {
+        // Synthetic migrations drive the failure path: v2 fails midway after
+        // creating a table; the transaction must leave version AND DDL at v1.
+        let c = Connection::open_in_memory().unwrap();
+        let boom: fn(&Connection) -> Result<()> = |c| {
+            c.execute_batch("CREATE TABLE should_rollback (id INTEGER);")?;
+            anyhow::bail!("deliberate failure mid-migration")
+        };
+        let list = &[
+            Migration {
+                version: 1,
+                description: "ok step",
+                up: |c: &Connection| Ok(c.execute_batch("CREATE TABLE stayed (id INTEGER);")?),
+            },
+            Migration {
+                version: 2,
+                description: "boom step",
+                up: boom,
+            },
+        ];
+        let err = run_migrations(&c, list).unwrap_err();
+        assert!(err.to_string().contains("boom step"));
+        assert_eq!(stamped_version(&c), 1, "failed step must not stamp");
+        assert!(table_exists(&c, "stayed"), "v1 committed");
+        assert!(
+            !table_exists(&c, "should_rollback"),
+            "failed step's DDL must roll back"
+        );
+        assert_eq!(schema_history(&c).unwrap().len(), 1);
+        // Recovery: fixing the step and re-running completes the upgrade.
+        let fixed = &[
+            Migration {
+                version: 1,
+                description: "ok step",
+                up: |c: &Connection| Ok(c.execute_batch("CREATE TABLE stayed (id INTEGER);")?),
+            },
+            Migration {
+                version: 2,
+                description: "fixed step",
+                up: |c: &Connection| Ok(c.execute_batch("CREATE TABLE fine (id INTEGER);")?),
+            },
+        ];
+        run_migrations(&c, fixed).unwrap();
+        assert_eq!(stamped_version(&c), 2);
+        assert!(table_exists(&c, "fine"));
+        assert_eq!(schema_history(&c).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn downgrade_is_refused() {
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        // A binary older than the database's writer must refuse, not improvise.
+        set_meta(&c, META_SCHEMA_VERSION, &(SCHEMA_VERSION + 1).to_string()).unwrap();
+        let err = migrate(&c).unwrap_err();
+        assert!(err.to_string().contains("downgrade not supported"));
+        // The refusal must not have touched history or the version stamp.
+        assert_eq!(stamped_version(&c), SCHEMA_VERSION + 1);
+        assert_eq!(schema_history(&c).unwrap().len(), MIGRATIONS.len() as usize);
+    }
+
+    #[test]
+    fn migrate_is_idempotent() {
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        let v1 = stamped_version(&c);
+        let h1 = schema_history(&c).unwrap();
+        migrate(&c).unwrap();
+        assert_eq!(stamped_version(&c), v1);
+        assert_eq!(schema_history(&c).unwrap(), h1);
+    }
+
+    #[test]
+    fn history_records_every_migration() {
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        let history = schema_history(&c).unwrap();
+        assert_eq!(history.len(), MIGRATIONS.len());
+        for (record, m) in history.iter().zip(MIGRATIONS.iter()) {
+            assert_eq!(record.version, m.version);
+            assert_eq!(record.description, m.description);
+            assert!(record.applied_at > 0);
+        }
+        // Versions ascend without gaps — the framework's core invariant.
+        let versions: Vec<i64> = history.iter().map(|r| r.version).collect();
+        let expected: Vec<i64> = MIGRATIONS.iter().map(|m| m.version).collect();
+        assert_eq!(versions, expected);
+    }
 }

@@ -1773,6 +1773,49 @@ fn main() -> Result<()> {
                 }
             }
         }
+        // --- database schema report (FLEETD-DBMETA-001) ---
+        // Plain Connection::open, deliberately NOT ledger::open(): the value
+        // of this face is reporting exactly the state migrate() would refuse
+        // or upgrade — legacy (pre-meta) and too-new databases included.
+        Some("db") => {
+            let path = args
+                .get(3)
+                .map(PathBuf::from)
+                .unwrap_or_else(ledger::db_path);
+            anyhow::ensure!(
+                path.exists(),
+                "no ledger database at {} (set FLEETD_DB or pass a path)",
+                path.display()
+            );
+            let c = rusqlite::Connection::open(&path)
+                .with_context(|| format!("open {}", path.display()))?;
+            let info = ledger::db_schema_info(&c)?;
+            let sv = ledger::SCHEMA_VERSION;
+            println!("db:            {}", path.display());
+            println!("binary schema: {sv}");
+            match info.db_version {
+                0 if !info.has_meta => {
+                    println!("db schema:     legacy (no meta table; migrates to {sv} on next open)")
+                }
+                0 => println!("db schema:     unset (meta exists; migrates to {sv} on next open)"),
+                v if v == sv => println!("db schema:     {v} (up to date)"),
+                v if v < sv => println!("db schema:     {v} (migrates to {sv} on next open)"),
+                v => println!(
+                    "db schema:     {v} — NEWER THAN BINARY: this fleetd refuses to start (downgrade not supported)"
+                ),
+            }
+            if info.history.is_empty() {
+                println!("history:       (empty)");
+            } else {
+                println!("history:");
+                for h in &info.history {
+                    let at = chrono::DateTime::from_timestamp(h.applied_at, 0)
+                        .map(|t| t.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                        .unwrap_or_else(|| h.applied_at.to_string());
+                    println!("  v{} {}  {}", h.version, at, h.description);
+                }
+            }
+        }
         Some("review") => {
             let c = ledger::open()?;
             let flag = |name: &str| -> Option<String> {

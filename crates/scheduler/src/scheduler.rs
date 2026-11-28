@@ -210,23 +210,15 @@ mod tests {
 mod pyjob_tests {
     #[test]
     fn py_job_runs_embedded() {
-        // The scheduler loop calls pyhost::init; tests must too (OnceLock is
-        // per-process and the loop isn't running under cargo test).
-        struct NoopApi;
-        impl crate::pyhost::FleetdApi for NoopApi {
-            fn log(&self, _m: &str) {}
-            fn alert(&self, _m: &str) {}
-            fn seats(&self) -> Vec<(String, String)> {
-                Vec::new()
-            }
-            fn jobs(&self) -> Vec<(String, String, bool)> {
-                Vec::new()
-            }
-            fn run_job(&self, _name: &str) -> anyhow::Result<i32> {
-                Ok(0)
-            }
-        }
-        let _ = crate::pyhost::init(Box::new(NoopApi));
+        // Serialize FIRST, then register: the interpreter's very first
+        // Python::attach boots CPython, and a boot racing another test's
+        // attach leaves sys.modules half-initialized (the flaky "No module
+        // named 'fleetd'"). Everything interpreter-touching stays inside the
+        // lock (see pyhost::PY_TEST_LOCK / test_init).
+        let _g = crate::pyhost::PY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::pyhost::test_init();
         let path = std::env::temp_dir().join("fleetd-e2e-pyjob.py");
         std::fs::write(
             &path,
