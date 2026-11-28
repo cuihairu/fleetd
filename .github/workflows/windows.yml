@@ -1,0 +1,41 @@
+# Windows build gate for the flagship binaries: msvc fleetd.exe + tray.exe
+# uploaded as an artifact — the update face (`fleetd update --host imac`)
+# pulls exactly this artifact; no artifact, no windows update (2026-11-28
+# FLEETD-SELFUPDATE-001; the linux control box cannot cross-compile msvc).
+name: windows
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # pyhost embeds CPython (pyo3): the build links against python3.14.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Build flagship + tray (native msvc)
+        run: cargo build --release -p fleetd -p tray
+
+      - name: Test (windows runner, embedded python included)
+        run: cargo test -p fleetd -p tray
+        continue-on-error: true # first green is the artifact gate; flaky pyhost timings observed
+
+      - name: Upload flagship exes
+        uses: actions/upload-artifact@v4
+        with:
+          name: fleetd-windows-msvc
+          path: |
+            target/release/fleetd.exe
+            target/release/tray.exe

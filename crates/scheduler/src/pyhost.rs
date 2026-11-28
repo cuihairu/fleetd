@@ -62,6 +62,8 @@ pub fn init(api: Box<dyn FleetdApi>) -> Result<()> {
     }
     #[cfg(target_os = "windows")]
     configure_bundled_runtime();
+    #[cfg(not(target_os = "windows"))]
+    configure_bundled_runtime();
     Python::attach(|py| -> PyResult<()> {
         let module = PyModule::new(py, "fleetd")?;
         module.add_function(wrap_pyfunction!(fleetd_log, &module)?)?;
@@ -135,6 +137,41 @@ fn fleetd_run_job(name: &str) -> PyResult<i32> {
     api()
         .run_job(name)
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+}
+
+/// Unix: same bundle convention as the Windows face — a `runtime/` tree next
+/// to the exe (`lib/libpython*.so` + `lib/python3.x/` stdlib). The embedded
+/// interpreter cannot find a stdlib on ships without the system python
+/// package (work-runner 2026-11-28: `No module named 'encodings'`, same
+/// crash as the imac runtime-bundle gap). No-op when the bundle is absent —
+/// hosts with the system package keep using system paths.
+#[cfg(not(target_os = "windows"))]
+fn configure_bundled_runtime() {
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let Some(dir) = exe.parent() else { return };
+    let runtime = dir.join("runtime");
+    // Find the stdlib tree (python3.X, whatever minor the bundle carries).
+    let mut stdlib = None;
+    if let Ok(entries) = std::fs::read_dir(runtime.join("lib")) {
+        for e in entries.flatten() {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("python3.")
+                && e.path().join("encodings").join("__init__.py").exists()
+            {
+                stdlib = Some(e.path());
+                break;
+            }
+        }
+    }
+    let Some(stdlib) = stdlib else {
+        return; // no bundle: system paths
+    };
+    std::env::set_var("PYTHONHOME", &runtime);
+    std::env::set_var("PYTHONPATH", &stdlib);
 }
 
 /// Windows: point the interpreter at the bundled `runtime/` directory next

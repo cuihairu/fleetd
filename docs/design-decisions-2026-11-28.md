@@ -222,3 +222,25 @@ kill -9 → ~3s 复活；imac 停服→infra_down→修复→infra_up 全链落 
 - **host 形态分流**：`update [--host local|work-runner|imac]`，清单复用 infra-watch 三机
   常量；fleet.toml `[update]` 配置段未落（内置清单够用，如实登记不写假配置——对账令）。
 - 凭据走本机 ssh config（VAULT-001 交付后接 cred_ref，spec 原文如此安排）。
+
+**真机实录**（2026-11-28 验收，四陷阱全在远端 Linux 分发面）：
+1. **sftp 妖行为两条**：绝对路径 `host:/home/...` 目标 exit 0 但文件不落（work-runner 实测）；
+   尾斜杠目录目标 `host:.fleetd/lib/` 同样 exit 0 空落——**显式文件名+home 相对路径是唯一
+   可靠形态**。链条里 `A && B; C` 的分号吞失败（--version rc=127 后 pkill 照跑、pgrep rc=0
+   让 ssh 整体 exit 0）——**必须 set -e**。
+2. **libpython 动态链**：pyhost 让二进制 DT_NEEDED libpython3.14.so.1.0， ships 无系统
+   python3.14 即 rc=127；老进程靠旧 inode+旧环境续命极具迷惑性（pgrep 活≠二进制可跑）。
+   修法=库随分发+启动注入 `LD_LIBRARY_PATH=$HOME/.fleetd/runtime/lib`。
+3. **嵌入 Python 无 stdlib**：imac 同款崩在 work-runner 复现（`No module named 'encodings'`
+   → Py_Initialize abort）。补齐 **pyhost unix 侧 configure_bundled_runtime**（exe 旁
+   `runtime/lib/python3.x/` 探测→PYTHONHOME/PYTHONPATH，与 Windows 惯例对齐，缺 bundle
+   不影响系统 python 主机），update 分发 stdlib tar 流成套。
+4. **serve 行为漂移**：旧版 `serve --port 3790` 即 TCP 面，新版默认 UDS+`--http` 显式——
+   update 重启段必须显式 `--http`，否则远端"更新成功"但感知面反而变哑。
+
+**验收结果**：本机 check→update→--version 对齐→serve 200 ✓；work-runner 自动链
+b442b6f→b442b6f restarted、进程活+http 200+版本对齐 ✓；rollback 实测 ge4ea612 还原
+（**Text file busy 教训：运行中 exe 只能 rename 不能 copy**）→ serve 200 → 再 update 前进 ✓；
+events 落 update_applied×4+update_rollback ✓。**imac 面=artifact 门控**：main 新增
+windows.yml（msvc fleetd.exe+tray.exe artifact），`update --host imac` 拉
+`fleetd-windows-msvc` 分发，无 artifact 明确报错不半升级——imac 实测待 CI 首绿（外部条件）。

@@ -167,29 +167,120 @@ pub fn update_local(restart: bool) -> Result<(String, String)> {
     Ok((from, to))
 }
 
-/// Remote linux update: scp to `.new`, then one ssh round keeps `.bak` and
-/// renames. `--restart` bounces the bare `fleetd serve` process the way the
-/// ship runs it (observed: `/home/<user>/.fleetd/fleetd serve --port 3790`).
+/// The libpython shared library this binary dynamically links (pyhost
+/// embeds CPython), from ldd; None when statically linked or absent. Ships
+/// without the system python package would otherwise die on exec with
+/// `libpython3.14.so.1.0: cannot open shared object file` (observed live on
+/// work-runner, 2026-11-28 — the update must ship the library alongside).
+pub fn bundled_libpython() -> Option<String> {
+    let out = Command::new("ldd")
+        .arg(built_binary())
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines() {
+        if line.contains("libpython") && line.contains("=>") {
+            let path = line.split("=>").nth(1)?.trim();
+            let path = path.split_whitespace().next()?;
+            if !path.is_empty() {
+                return Some(path.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// The system stdlib tree to bundle (/usr/lib/python3.x on Debian-shaped
+/// hosts), found by probing the known roots. None when this host has no
+/// system python — then the bundle has no stdlib and remote pyhost stays
+/// dependent on whatever the ship already has.
+pub fn system_stdlib_dir() -> Option<String> {
+    for base in ["/usr/lib", "/usr/local/lib"] {
+        if let Ok(entries) = std::fs::read_dir(base) {
+            let mut found: Vec<(String, String)> = entries
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .filter(|n| n.starts_with("python3."))
+                .map(|n| {
+                    let p = format!("{base}/{n}");
+                    // Sort key: the numeric minor, newest wins.
+                    let minor: u32 = n
+                        .trim_start_matches("python3.")
+                        .parse()
+                        .unwrap_or(0);
+                    (p, minor.to_string())
+                })
+                .collect();
+            found.sort_by(|a, b| b.1.cmp(&a.1));
+            if let Some((p, _)) = found.first() {
+                return Some(p.clone());
+            }
+        }
+    }
+    None
+}
+
+/// Remote linux update: scp to an absolute `.new` path (sftp does not expand
+/// `$HOME` in target paths), ship the libpython dependency alongside, then
+/// one `set -e` ssh round keeps `.bak` and renames — a failing step aborts
+/// the whole chain and the ssh exit code carries the failure (a bare `;`
+/// chain once masked a rc=127 and left the ship half-updated, observed live).
+/// `--restart` bounces the bare `fleetd serve` process the way the ship runs
+/// it (observed: `/home/<user>/.fleetd/fleetd serve --port 3790`).
 pub fn update_remote_linux(host: &str, restart: bool) -> Result<(String, String)> {
     let active = built_binary();
-    let remote_dir = ".fleetd";
+    // Home-relative paths: sftp resolves them against the login dir and an
+    // absolute `host:/home/...` target once exited 0 without landing the
+    // file (observed live on work-runner, 2026-11-28) — relative works.
+    let dir = ".fleetd";
     sh(&format!(
-        "scp -o BatchMode=yes {} {host}:{remote_dir}/fleetd.new",
+        "ssh -o BatchMode=yes {host} 'mkdir -p {dir}/runtime/lib'"
+    ))?;
+    // Bundle the runtime the way the exe expects it (pyhost looks for
+    // runtime/lib/python3.x next to the binary): the shared library plus
+    // the stdlib tree. Ships without the system python package would
+    // otherwise die on `No module named 'encodings'` (observed live on
+    // work-runner AND imac, 2026-11-28).
+    if let Some(lib) = bundled_libpython() {
+        // Explicit remote filename — a trailing-slash directory target
+        // exits 0 without landing the file under sftp (observed live).
+        let name = lib.rsplit('/').next().unwrap_or("libpython3.so");
+        sh(&format!("scp -o BatchMode=yes {lib} {host}:{dir}/runtime/lib/{name}"))
+            .with_context(|| format!("scp {lib} to {host}"))?;
+    }
+    // The stdlib tree rides a tar stream — scp has no -r equivalent that
+    // survives the sftp path quirks, and tar preserves everything in one shot.
+    if let Some(stdlib) = system_stdlib_dir() {
+        sh(&format!(
+            "tar -C {stdlib} -cf - . | ssh -o BatchMode=yes {host} \
+             'mkdir -p {dir}/runtime/lib/python3.14 && tar -C {dir}/runtime/lib/python3.14 -xf -'"
+        ))
+        .with_context(|| format!("ship stdlib tree to {host}"))?;
+    }
+    sh(&format!(
+        "scp -o BatchMode=yes {} {host}:{dir}/fleetd.new",
         active.display()
     ))
     .with_context(|| format!("scp binary to {host}"))?;
+    // LD_LIBRARY_PATH uses $HOME on purpose: the whole script sits inside a
+    // single-quoted ssh command, so the REMOTE shell expands it.
+    let ld = "LD_LIBRARY_PATH=$HOME/.fleetd/runtime/lib";
     let mut script = format!(
-        "cp {remote_dir}/fleetd {remote_dir}/fleetd.bak && \
-         mv {remote_dir}/fleetd.new {remote_dir}/fleetd && \
-         chmod +x {remote_dir}/fleetd && {remote_dir}/fleetd --version"
+        "set -e; \
+         cp {dir}/fleetd {dir}/fleetd.bak; \
+         mv {dir}/fleetd.new {dir}/fleetd; \
+         chmod +x {dir}/fleetd; \
+         {ld} {dir}/fleetd --version"
     );
     if restart {
         // Kill then relaunch detached; the SSH session must not own the
-        // process, hence setsid + nohup + redirect.
-        script.push_str(
-            " && pkill -x fleetd; sleep 1; setsid nohup .fleetd/fleetd serve --port 3790 \
-             >/dev/null 2>&1 & sleep 1; pgrep -x fleetd",
-        );
+        // process, hence setsid + nohup + redirect. Same LD_LIBRARY_PATH
+        // injection, or the new exec dies where the version probe did.
+        script.push_str(&format!(
+            "; pkill -x fleetd; sleep 1; \
+             {ld} setsid nohup {dir}/fleetd serve --port 3790 --http >/dev/null 2>&1 & \
+             sleep 1; pgrep -x fleetd"
+        ));
     }
     let version_out = sh(&format!("ssh -o BatchMode=yes {host} '{script}'"))
         .with_context(|| format!("remote swap on {host}"))?;
@@ -207,30 +298,50 @@ pub fn update_remote_linux(host: &str, restart: bool) -> Result<(String, String)
     Ok((from, to))
 }
 
-/// Windows update: scp to a temp name, then one PowerShell script does
+/// Windows update: the msvc exe cannot be produced on this linux control
+/// box, so it comes from CI — the newest `fleetd-windows-msvc` artifact
+/// (see .github/workflows/windows.yml). One PowerShell script then does
 /// stop-service → backup → swap → start-service (plus tray replacement when
-/// a tray exe is deployed). Returns from→to hashes.
+/// the artifact carries it), with the stop window measured in-script.
+/// Returns from→to hashes.
 pub fn update_remote_windows(host: &str, restart: bool) -> Result<(String, String)> {
-    let active = built_binary();
+    let _ = restart; // the service bounce IS the restart; guard ran upstream
+    let tmp = std::env::temp_dir().join("fleetd-imac-update");
     sh(&format!(
-        "scp -o BatchMode=yes {} {host}:C:/Users/cui/.fleetd/fleetd.new.exe",
-        active.display()
+        "rm -rf {} && mkdir -p {} && gh run download -R cuihairu/fleetd \
+         --name fleetd-windows-msvc -D {} && ls {}/fleetd.exe",
+        tmp.display(),
+        tmp.display(),
+        tmp.display(),
+        tmp.display()
+    ))
+    .context(
+        "no fleetd-windows-msvc artifact available (the windows CI on main \
+         must be green first); nothing was touched",
+    )?;
+    sh(&format!(
+        "scp -o BatchMode=yes {}/fleetd.exe {host}:C:/Users/cui/.fleetd/fleetd.new.exe",
+        tmp.display()
     ))
     .with_context(|| format!("scp binary to {host}"))?;
+    // Tray rides along when the artifact carries it — best effort.
+    let _ = sh(&format!(
+        "scp -o BatchMode=yes {}/tray.exe {host}:C:/Users/cui/.fleetd/fleetd-tray.exe.new",
+        tmp.display()
+    ));
     let ps = format!(
         "$d='C:/Users/cui/.fleetd'; \
-         Stop-Service FleetD -Force; \
-         Copy-Item \"$d/fleetd.exe\" \"$d/fleetd.exe.bak\" -Force; \
-         Move-Item \"$d/fleetd.new.exe\" \"$d/fleetd.exe\" -Force; \
-         if (Test-Path \"$d/fleetd-tray.exe.new\") {{ \
-             Copy-Item \"$d/fleetd-tray.exe\" \"$d/fleetd-tray.exe.bak\" -Force -ErrorAction SilentlyContinue; \
-             Move-Item \"$d/fleetd-tray.exe.new\" \"$d/fleetd-tray.exe\" -Force }}; \
-         Start-Service FleetD; \
+         $t = Measure-Command {{ \
+             Stop-Service FleetD -Force; \
+             Copy-Item \"$d/fleetd.exe\" \"$d/fleetd.exe.bak\" -Force; \
+             Move-Item \"$d/fleetd.new.exe\" \"$d/fleetd.exe\" -Force; \
+             if (Test-Path \"$d/fleetd-tray.exe.new\") {{ \
+                 Copy-Item \"$d/fleetd-tray.exe\" \"$d/fleetd-tray.exe.bak\" -Force -ErrorAction SilentlyContinue; \
+                 Move-Item \"$d/fleetd-tray.exe.new\" \"$d/fleetd-tray.exe\" -Force }}; \
+             Start-Service FleetD }}; \
+         Write-Output ('stop_window_ms=' + [int]$t.TotalMilliseconds); \
          (Get-Service FleetD).Status"
     );
-    // The service bounce is the restart; when --restart was not given, the
-    // live-work guard already refused for us, so here we always bounce.
-    let _ = restart;
     sh(&format!(
         "ssh -o BatchMode=yes {host} \"powershell -NoProfile -Command '{ps}'\""
     ))
@@ -254,21 +365,27 @@ pub fn rollback(host: &str, restart: bool) -> Result<()> {
             if !bak.exists() {
                 bail!("no {} — nothing to roll back to", bak.display());
             }
-            std::fs::copy(&bak, &active).context("restore backup over active binary")?;
+            // Rename, not copy: the running serve executes this exact file,
+            // and Linux refuses to write a busy executable (Text file busy).
+            let staged = active.with_extension("bak.rollback");
+            std::fs::copy(&bak, &staged).context("stage backup for rollback")?;
+            std::fs::rename(&staged, &active).context("restore backup over active binary")?;
             if restart {
                 sh("systemctl --user restart fleetd").context("restart fleetd unit")?;
             }
         }
         _ => {
+            let dir = ".fleetd";
+            let ld = "LD_LIBRARY_PATH=$HOME/.fleetd/runtime/lib";
             let script =
-                format!("cp .fleetd/fleetd.bak .fleetd/fleetd && .fleetd/fleetd --version");
+                format!("set -e; cp {dir}/fleetd.bak {dir}/fleetd; {ld} {dir}/fleetd --version");
             sh(&format!("ssh -o BatchMode=yes {host} '{script}'"))
                 .with_context(|| format!("rollback on {host}"))?;
             if restart {
                 sh(&format!(
                     "ssh -o BatchMode=yes {host} \
-                     'pkill -x fleetd; sleep 1; setsid nohup .fleetd/fleetd serve \
-                      --port 3790 >/dev/null 2>&1 & sleep 1; pgrep -x fleetd'"
+                     'pkill -x fleetd; sleep 1; {ld} setsid nohup {dir}/fleetd serve \
+                      --port 3790 --http >/dev/null 2>&1 & sleep 1; pgrep -x fleetd'"
                 ))?;
             }
         }
