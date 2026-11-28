@@ -13,5 +13,10 @@ fn main() {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=FLEETD_BUILD_HASH={hash}");
+    // Watch the REF, not just HEAD: a commit rewrites .git/refs/heads/main
+    // while .git/HEAD (the symref) never changes — watching HEAD alone let
+    // release builds silently keep a stale hash after every commit
+    // (hit for real on the DBMETA-001 and RES-002 deploys).
     println!("cargo:rerun-if-changed=.git/HEAD");
+    println!("cargo:rerun-if-changed=.git/refs/heads");
 }
